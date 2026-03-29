@@ -3,7 +3,10 @@
 GoPro Hero 10 Intrinsic Calibration from Checkerboard
 =====================================================
 Extracts frames from synced multi-camera video, auto-detects the checkerboard
-size, runs cv2.calibrateCamera() per camera, and outputs calibration JSONs.
+size, runs cv2.calibrateCamera() per camera, and outputs:
+  - Minimal intrinsics JSON (K, distortion, image size, RMS)
+  - Combined calibration JSON + checkerboard config
+  - Validation images: corner overlays + per-frame error bar chart
 
 Usage:
     python run_calibration.py [--base DIR] [--session SESSION] [--cams N]
@@ -50,6 +53,66 @@ BOARD_CANDIDATES = [
     (10, 7),  # 11x8 squares
 ]
 
+# How many sample frames to draw corner overlays on per camera
+VALIDATION_SAMPLE_COUNT = 4
+
+
+# ─── VALIDATION VISUALISATION ────────────────────────────────────
+def draw_corner_overlay(img, corners_detected, corners_reprojected, board_size):
+    """Draw detected (green) and reprojected (red) corners on an image copy."""
+    vis = img.copy()
+    # Detected corners in green
+    cv2.drawChessboardCorners(vis, board_size, corners_detected, True)
+    # Reprojected corners in red circles
+    for pt in corners_reprojected.reshape(-1, 2):
+        cv2.circle(vis, (int(pt[0]), int(pt[1])), 8, (0, 0, 255), 2)
+    return vis
+
+
+def make_error_bar_chart(per_frame_errors, cam_label, output_path):
+    """Save a per-frame reprojection error bar chart as PNG using matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(max(6, len(per_frame_errors) * 0.18), 4))
+    x = np.arange(len(per_frame_errors))
+    colors = ["#e74c3c" if e > 0.1 else "#f39c12" if e > 0.06 else "#2ecc71"
+              for e in per_frame_errors]
+    ax.bar(x, per_frame_errors, color=colors, width=0.8)
+    ax.axhline(np.mean(per_frame_errors), color="#3498db", linestyle="--",
+               linewidth=1.5, label=f"mean = {np.mean(per_frame_errors):.4f} px")
+    ax.set_xlabel("Frame index")
+    ax.set_ylabel("Reprojection error (px)")
+    ax.set_title(f"{cam_label} — Per-Frame Reprojection Error")
+    ax.legend()
+    ax.set_xlim(-0.5, len(per_frame_errors) - 0.5)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def make_summary_chart(cam_rms, output_path):
+    """Bar chart comparing RMS across all cameras."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = list(cam_rms.keys())
+    values = list(cam_rms.values())
+
+    fig, ax = plt.subplots(figsize=(max(4, len(labels) * 1.2), 4))
+    bars = ax.bar(labels, values, color="#3498db", width=0.5)
+    for bar, v in zip(bars, values):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.002,
+                f"{v:.4f}", ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("RMS Reprojection Error (px)")
+    ax.set_title("Calibration RMS — All Cameras")
+    ax.set_ylim(0, max(values) * 1.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
 
 # ─── MAIN ─────────────────────────────────────────────────────────
 def main():
@@ -63,8 +126,10 @@ def main():
 
     SYNCED_DIR = os.path.join(BASE, "output", SESSION, "synced_raw")
     OUTPUT = os.path.join(BASE, "output", "calibration")
+    VALIDATION = os.path.join(OUTPUT, "validation")
     WORK = os.path.join(BASE, ".calib_work")
     os.makedirs(OUTPUT, exist_ok=True)
+    os.makedirs(VALIDATION, exist_ok=True)
     os.makedirs(WORK, exist_ok=True)
 
     # ── Extract frames ────────────────────────────────────────────
@@ -134,6 +199,7 @@ def main():
     # ── Calibrate each camera ─────────────────────────────────────
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     all_results = {}
+    cam_rms_map = {}
 
     for cam in range(1, NUM_CAMS + 1):
         print(f"\n{'=' * 70}")
@@ -143,7 +209,7 @@ def main():
         frames = sorted(glob.glob(os.path.join(WORK, f"cam{cam}_hires", "*.jpg")))
         obj_points = []
         img_points = []
-        used_frames = []
+        used_frame_paths = []
         img_shape = None
 
         for fpath in frames:
@@ -164,17 +230,14 @@ def main():
                 )
                 obj_points.append(objp)
                 img_points.append(corners_refined)
-                used_frames.append(os.path.basename(fpath))
+                used_frame_paths.append(fpath)
 
-        print(f"  Detected checkerboard in {len(used_frames)}/{len(frames)} frames")
+        print(f"  Detected checkerboard in {len(used_frame_paths)}/{len(frames)} frames")
         print(f"  Image size: {img_shape}")
 
         if len(obj_points) < 5:
             print(f"  WARNING: not enough detections ({len(obj_points)}), need >= 5")
-            all_results[f"cam{cam}"] = {
-                "error": "insufficient detections",
-                "detections": len(obj_points),
-            }
+            all_results[f"cam{cam}"] = {"error": "insufficient detections"}
             continue
 
         ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
@@ -183,10 +246,12 @@ def main():
 
         # Per-frame reprojection error
         reproj_errors = []
+        reproj_points = []
         for i in range(len(obj_points)):
             proj, _ = cv2.projectPoints(obj_points[i], rvecs[i], tvecs[i], K, dist)
             err = cv2.norm(img_points[i], proj, cv2.NORM_L2) / len(proj)
             reproj_errors.append(err)
+            reproj_points.append(proj)
 
         fx, fy = K[0, 0], K[1, 1]
         cx, cy = K[0, 2], K[1, 2]
@@ -199,23 +264,14 @@ def main():
         print(f"    Principal point: cx={cx:.2f}, cy={cy:.2f} px")
         print(f"    Distortion: {dist.flatten()}")
 
-        w, h = img_shape
-        new_K, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 1, (w, h))
+        cam_rms_map[f"Cam {cam}"] = ret
 
+        # ── Minimal intrinsics JSON (only what downstream needs) ──
         result = {
-            "camera": f"cam{cam}",
-            "image_size": {"width": w, "height": h},
-            "num_frames_used": len(used_frames),
-            "rms_reprojection_error_px": round(ret, 6),
-            "mean_reprojection_error_px": round(float(np.mean(reproj_errors)), 6),
-            "max_reprojection_error_px": round(float(np.max(reproj_errors)), 6),
-            "camera_matrix_K": K.tolist(),
-            "distortion_coefficients": dist.flatten().tolist(),
-            "new_camera_matrix": new_K.tolist(),
-            "undistort_roi": list(roi),
-            "focal_length_px": {"fx": round(fx, 4), "fy": round(fy, 4)},
-            "principal_point_px": {"cx": round(cx, 4), "cy": round(cy, 4)},
-            "used_frames": used_frames,
+            "image_size": [img_shape[0], img_shape[1]],
+            "K": K.tolist(),
+            "dist": dist.flatten().tolist(),
+            "rms_error_px": round(ret, 6),
         }
         all_results[f"cam{cam}"] = result
 
@@ -223,6 +279,43 @@ def main():
         with open(cam_path, "w") as f:
             json.dump(result, f, indent=2)
         print(f"    -> Saved {os.path.basename(cam_path)}")
+
+        # ── Validation: corner overlay images ─────────────────────
+        print(f"\n  Generating validation images...")
+        cam_val_dir = os.path.join(VALIDATION, f"cam{cam}")
+        os.makedirs(cam_val_dir, exist_ok=True)
+
+        # Pick evenly spaced sample frames
+        n = len(used_frame_paths)
+        if n <= VALIDATION_SAMPLE_COUNT:
+            sample_indices = list(range(n))
+        else:
+            sample_indices = [int(i * (n - 1) / (VALIDATION_SAMPLE_COUNT - 1))
+                              for i in range(VALIDATION_SAMPLE_COUNT)]
+
+        for idx in sample_indices:
+            fpath = used_frame_paths[idx]
+            fname = os.path.basename(fpath)
+            img = cv2.imread(fpath)
+            vis = draw_corner_overlay(img, img_points[idx], reproj_points[idx], BOARD_SIZE)
+            # Scale down for reasonable file size
+            h_vis, w_vis = vis.shape[:2]
+            scale = 1200 / w_vis
+            vis_small = cv2.resize(vis, (int(w_vis * scale), int(h_vis * scale)))
+            out_path = os.path.join(cam_val_dir, f"corners_{fname}")
+            cv2.imwrite(out_path, vis_small, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            print(f"    -> {os.path.relpath(out_path, OUTPUT)}")
+
+        # ── Validation: per-frame error bar chart ─────────────────
+        chart_path = os.path.join(cam_val_dir, "reproj_error_per_frame.png")
+        make_error_bar_chart(reproj_errors, f"Cam {cam}", chart_path)
+        print(f"    -> {os.path.relpath(chart_path, OUTPUT)}")
+
+    # ── Summary chart across all cameras ──────────────────────────
+    if cam_rms_map:
+        summary_path = os.path.join(VALIDATION, "rms_all_cameras.png")
+        make_summary_chart(cam_rms_map, summary_path)
+        print(f"\n  -> validation/rms_all_cameras.png")
 
     # ── Combined calibration file ─────────────────────────────────
     print(f"\n{'=' * 70}")
@@ -233,19 +326,9 @@ def main():
         "checkerboard": {
             "inner_corners": list(BOARD_SIZE),
             "square_size_m": SQUARE_SIZE_M,
-            "square_size_cm": SQUARE_SIZE_M * 100,
             "board_squares": [BOARD_SIZE[0] + 1, BOARD_SIZE[1] + 1],
-            "description": (
-                f"{BOARD_SIZE[0]+1}x{BOARD_SIZE[1]+1} squares, "
-                f"{BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners, "
-                f"{SQUARE_SIZE_M*100:.0f}cm per square"
-            ),
         },
-        "source": f"{SESSION} synced footage",
-        "camera_model": "GoPro Hero 10",
-        "lens_mode": "Wide",
-        "resolution": "3840x2160 (4K)",
-        "fps": "59.94",
+        "source_session": SESSION,
         "cameras": all_results,
     }
 
@@ -256,21 +339,9 @@ def main():
 
     # ── Checkerboard config file ──────────────────────────────────
     config = {
-        "checkerboard_config": {
-            "inner_corners_cols": BOARD_SIZE[0],
-            "inner_corners_rows": BOARD_SIZE[1],
-            "square_size_meters": SQUARE_SIZE_M,
-            "square_size_cm": SQUARE_SIZE_M * 100,
-            "total_squares_cols": BOARD_SIZE[0] + 1,
-            "total_squares_rows": BOARD_SIZE[1] + 1,
-            "board_width_m": (BOARD_SIZE[0] + 1) * SQUARE_SIZE_M,
-            "board_height_m": (BOARD_SIZE[1] + 1) * SQUARE_SIZE_M,
-        },
-        "opencv_usage": {
-            "findChessboardCorners_size": f"({BOARD_SIZE[0]}, {BOARD_SIZE[1]})",
-            "object_point_scale": SQUARE_SIZE_M,
-            "note": "Inner corners = squares - 1 in each dimension",
-        },
+        "inner_corners": list(BOARD_SIZE),
+        "square_size_m": SQUARE_SIZE_M,
+        "board_squares": [BOARD_SIZE[0] + 1, BOARD_SIZE[1] + 1],
     }
     config_path = os.path.join(OUTPUT, "checkerboard_config.json")
     with open(config_path, "w") as f:
@@ -289,11 +360,12 @@ def main():
         if "error" in r:
             print(f"  Cam {cam}: FAILED - {r['error']}")
         else:
-            print(f"  Cam {cam}: RMS={r['rms_reprojection_error_px']:.4f}px, "
-                  f"fx={r['focal_length_px']['fx']:.1f}, fy={r['focal_length_px']['fy']:.1f}, "
-                  f"cx={r['principal_point_px']['cx']:.1f}, cy={r['principal_point_px']['cy']:.1f}, "
-                  f"{r['num_frames_used']} frames")
+            K_arr = np.array(r["K"])
+            print(f"  Cam {cam}: RMS={r['rms_error_px']:.4f}px, "
+                  f"fx={K_arr[0,0]:.1f}, fy={K_arr[1,1]:.1f}, "
+                  f"cx={K_arr[0,2]:.1f}, cy={K_arr[1,2]:.1f}")
     print(f"\nOutput: {OUTPUT}/")
+    print(f"Validation: {VALIDATION}/")
     print("Done!")
 
 

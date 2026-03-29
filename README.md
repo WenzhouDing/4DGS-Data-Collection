@@ -1,44 +1,55 @@
 # GoPro Multi-Camera 3D Vision Rig
 
-Frame-accurate sync and intrinsic calibration pipeline for a multi-camera GoPro Hero 10 rig used in 3D vision work.
+Frame-accurate sync, intrinsic calibration, and extrinsic (stereo) calibration pipeline for a multi-camera GoPro Hero 10 rig used in 3D vision work.
 
 ## What This Does
 
-**Sync pipeline** — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid, per-session metadata JSON, and a sync report with sanity checks.
+**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid, per-session metadata JSON, and a sync report with sanity checks.
 
-**Calibration pipeline** — Extracts frames from a session where a checkerboard was visible, auto-detects the board geometry, and runs OpenCV's `calibrateCamera()` per camera. Outputs per-camera intrinsic matrices, distortion coefficients, and a combined calibration file.
+**Calibration pipeline** (`run_calibration.py`) — Two-phase calibration from a synced checkerboard session:
+
+1. **Intrinsic calibration** — Extracts frames to a temp directory, auto-detects checkerboard geometry, runs `cv2.calibrateCamera()` per camera. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
+
+2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both Camera 1 (reference) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS.
+
+Both phases share the same corner detections — frame indices correspond across synced cameras, so matching is by filename. Extracted frames go to a system temp directory and are automatically cleaned up after calibration finishes.
 
 ## Directory Layout
 
 ```
 .
-├── sync_pipeline.py          # Multi-session audio sync
-├── run_calibration.py        # Checkerboard intrinsic calibration
+├── sync_pipeline.py                # Multi-session audio sync
+├── run_calibration.py              # Intrinsic + extrinsic calibration
 ├── requirements.txt
-├── gopro_hero10_3d_rig_config.txt   # Camera settings + QR code reference
-├── 1/                        # Camera 1 raw footage (gitignored)
+├── gopro_hero10_3d_rig_config.txt  # Camera settings + QR code reference
+├── 1/                              # Camera 1 raw footage (gitignored)
 │   ├── GX010004.MP4
 │   ├── GL010004.LRV
 │   └── ...
-├── 2/                        # Camera 2 raw footage
-├── ...
-└── output/                   # All pipeline output (gitignored)
+├── 2/ ... 5/                       # Camera 2–5 raw footage
+└── output/                         # All pipeline output (gitignored)
     ├── session_01/
     │   ├── synced_raw/
-    │   │   ├── cam1_synced.mp4
-    │   │   └── ...
+    │   │   ├── cam1_synced.mp4 ... cam5_synced.mp4
     │   ├── session_01_preview.mp4
     │   ├── session_01_sync_report.md
     │   └── metadata/
     │       ├── session_01_metadata.json
     │       └── *.THM
-    ├── session_02/
-    ├── ...
+    ├── session_02/ ...
     └── calibration/
+        ├── cam1_intrinsics.json ... cam5_intrinsics.json
+        ├── cam2_extrinsics.json ... cam5_extrinsics.json
         ├── calibration_all_cameras.json
-        ├── cam1_intrinsics.json
-        ├── ...
-        └── checkerboard_config.json
+        ├── checkerboard_config.json
+        └── validation/
+            ├── cam1/ ... cam5/
+            │   ├── corners_frame_*.jpg     # detected vs reprojected corners
+            │   └── reproj_error_per_frame.png
+            ├── rms_all_cameras.png         # intrinsic RMS comparison
+            └── stereo/
+                ├── pair_1_*_cam*.jpg       # epipolar line overlays
+                └── stereo_rms.png          # stereo RMS comparison
 ```
 
 Raw footage folders (`1/`, `2/`, ...) and `output/` are gitignored — only the scripts, config, and docs are tracked.
@@ -76,7 +87,7 @@ See the config file for per-camera naming QR codes (`!MBASE`) and time sync opti
 2. Optionally flash per-camera naming QR codes (`CAM01`, `CAM02`, ...).
 3. Start all cameras recording.
 4. **Clap once** clearly within the first ~10 seconds — this is the sync reference.
-5. Shoot the scene.
+5. Shoot the scene. For calibration, hold a checkerboard visible to all cameras.
 6. Stop all cameras.
 7. Copy each camera's SD card into its own numbered folder (`1/`, `2/`, etc.).
 
@@ -87,8 +98,6 @@ From the project root (the directory containing folders `1/`, `2/`, ...):
 ```bash
 python sync_pipeline.py --base . --cams 5
 ```
-
-Options:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -121,8 +130,6 @@ python sync_pipeline.py --base . --cams 5
 python run_calibration.py --base . --session session_04 --square-size 0.03
 ```
 
-Options:
-
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `.` | Project root |
@@ -131,12 +138,71 @@ Options:
 | `--square-size` | `0.03` | Checkerboard square side in metres |
 | `--fps-extract` | `0.5` | Frame extraction rate (0.5 = one frame every 2 s) |
 
-The script auto-detects the checkerboard inner-corner count by trying several candidates. It uses subpixel corner refinement and reports RMS reprojection error per camera.
+### Phase 1: Intrinsic Calibration
 
-Output lands in `output/calibration/`:
-- `camN_intrinsics.json` — camera matrix K, distortion coefficients, optimal undistortion matrix, per-frame errors, frames used.
-- `calibration_all_cameras.json` — all cameras combined with checkerboard metadata.
-- `checkerboard_config.json` — board geometry for downstream stereo calibration.
+The script extracts frames from each camera's synced video into a system temp directory (automatically cleaned up when the script finishes). It then auto-detects the checkerboard by trying several inner-corner candidates against frames from Camera 1. Whichever board size gets the most detections wins.
+
+For each camera, all frames where the board was detected go through subpixel corner refinement (`cv2.cornerSubPix`) and then into `cv2.calibrateCamera()`. The output per camera is a minimal JSON:
+
+```json
+{
+  "image_size": [3840, 2160],
+  "K": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+  "dist": [k1, k2, p1, p2, k3],
+  "rms_error_px": 0.2855
+}
+```
+
+`K` is the 3x3 camera matrix (focal lengths fx/fy in pixels, principal point cx/cy). `dist` is the 5-coefficient distortion vector (radial k1/k2/k3, tangential p1/p2). These two are everything needed for undistortion via `cv2.undistort(img, K, dist)` or downstream stereo work. Anything else (optimal new camera matrix, undistort ROI) is recomputable from K and dist, so it's not stored.
+
+### Phase 2: Extrinsic (Stereo) Calibration
+
+Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same frame index. Since the videos are time-synced, matching frame indices means matching physical moments, which means the board was in the same pose.
+
+For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The output per pair:
+
+```json
+{
+  "reference": "cam1",
+  "target": "cam2",
+  "R": [[...], [...], [...]],
+  "T": [tx, ty, tz],
+  "E": [[...], [...], [...]],
+  "F": [[...], [...], [...]],
+  "stereo_rms_px": 0.4096,
+  "baseline_m": 0.0999,
+  "euler_deg": {"rx": -0.87, "ry": 0.01, "rz": -0.29},
+  "shared_frames": 41
+}
+```
+
+`R` is the 3x3 rotation matrix from cam1's coordinate system to camN. `T` is the translation vector in metres — its norm is the baseline distance between the two cameras. `E` and `F` are the essential and fundamental matrices. `stereo_rms_px` is the stereo reprojection error (how well the geometry fits the observed correspondences). `euler_deg` decomposes R into ZYX Euler angles for quick sanity checking.
+
+The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters.
+
+### What to Look For
+
+**Intrinsic RMS** should be under ~0.5 px for GoPro Wide at 4K. Values above 1px suggest poor board visibility, motion blur, or too few frames.
+
+**Stereo RMS** should be under ~1 px for a well-calibrated pair. A large stereo RMS (like 20+ px) indicates a problem — common causes: the board wasn't fully visible to both cameras simultaneously, there's a sync error, or the camera was at a very oblique angle to the board.
+
+**Baselines** should match your physical rig geometry. If cameras are evenly spaced in a line, expect baselines to increase linearly (e.g. 10cm, 20cm, 30cm, 40cm for 10cm spacing).
+
+**Euler angles** should be small if cameras are roughly parallel. Large rotations (> 5-10 degrees) might indicate a tilted camera or a calibration issue.
+
+### Validation Output
+
+The `validation/` folder contains visual sanity checks:
+
+**Intrinsic validation** (`validation/cam{N}/`):
+- `corners_frame_*.jpg` — 4 sample frames per camera showing detected corners (green, from `drawChessboardCorners`) overlaid with reprojected corners (red circles). Green and red should overlap tightly.
+- `reproj_error_per_frame.png` — bar chart of per-frame reprojection error, color-coded green (< 0.06px) / yellow (< 0.1px) / red (> 0.1px) with a mean line.
+
+**Intrinsic summary** (`validation/rms_all_cameras.png`) — cross-camera RMS comparison bar chart.
+
+**Stereo validation** (`validation/stereo/`):
+- `pair_1_{N}_frame_*_cam1.jpg` and `pair_1_{N}_frame_*_camN.jpg` — epipolar line overlays on 2 sample shared frames per pair. For each coloured dot (a detected checkerboard corner), the corresponding epipolar line is drawn in the other camera's image. The dot in the second image should sit on or very near the line. Large deviations mean the stereo geometry is off.
+- `stereo_rms.png` — cross-pair stereo RMS bar chart. Outlier pairs are immediately visible.
 
 ## GoPro File Types
 
@@ -150,9 +216,9 @@ File numbering differs across cameras — that's why pairing is done by recordin
 
 ## Next Steps (Not Yet Implemented)
 
-- **Stereo / extrinsic calibration** — Use the intrinsics + a shared checkerboard session to compute relative camera poses via `cv2.stereoCalibrate()`.
 - **Undistortion** — Apply the calibrated intrinsics to remove lens distortion before 3D reconstruction.
-- **Dense matching / depth** — Feed undistorted, synced frames into a stereo or multi-view stereo pipeline.
+- **Stereo rectification** — Use extrinsics to compute rectification transforms (`cv2.stereoRectify`) for aligned epipolar geometry.
+- **Dense matching / depth** — Feed undistorted, rectified, synced frames into a stereo or multi-view stereo pipeline.
 
 ## License
 

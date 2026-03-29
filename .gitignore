@@ -1,0 +1,43 @@
+# ─── Raw GoPro footage (camera folders) ───────────────────────────
+# Each camera's raw files live in numbered folders: 1/ 2/ 3/ ...
+# These are large binary video files and should NOT be in git.
+[0-9]/
+[0-9][0-9]/
+
+# ─── Pipeline output ──────────────────────────────────────────────
+output/
+
+# ─── Temporary work directories ──────────────────────────────────
+.sync_work/
+.calib_work/
+
+# ─── Video / audio files anywhere ────────────────────────────────
+*.MP4
+*.mp4
+*.LRV
+*.THM
+*.WAV
+*.wav
+
+# ─── OS junk ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# ─── Editors / IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

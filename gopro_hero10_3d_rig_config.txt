@@ -1,0 +1,82 @@
+============================================================
+  GoPro Hero 10 — 3D Vision Rig Configuration
+  Generated: 2026-03-25
+============================================================
+
+QR CODE COMMAND STRING:
+  mVr4p60e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
+
+QR CODE URL (open in browser, scan with camera):
+  https://gopro.github.io/labs/control/set/?cmd=mVr4p60e0!NfL0thS0dR0aScFd1b1w45i4M4S180x0sLa
+
+QR CODE CREATOR PAGE (to modify settings):
+  https://gopro.github.io/labs/control/custom/
+
+============================================================
+  VIDEO SETTINGS
+============================================================
+Camera Mode:       Video
+Video Resolution:  4K (16:9)
+Frame Rate:        60 fps
+Hypersmooth:       Off
+Lens / FOV:        Wide
+Hindsight:         Off
+Duration:          Off (records until manually stopped)
+Wind Reduction:    Off
+
+============================================================
+  PROTUNE SETTINGS
+============================================================
+Protune Color:     Flat
+Color Depth:       10-bit
+Bit Rate:          High
+White Balance:     4500K (fixed — adjust to match your lights)
+ISO Min:           400
+ISO Max:           400 (locked — both min and max = 400)
+Lock Shutter:      180° (= 1/120s at 60fps)
+EV Compensation:   0
+Sharpness:         Low
+RAW Audio:         Off
+
+============================================================
+  PER-CAMERA FILE NAMING (flash separately per camera)
+============================================================
+Camera 01:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM01%22
+Camera 02:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM02%22
+Camera 03:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM03%22
+Camera 04:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM04%22
+Camera 05:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM05%22
+Camera 06:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM06%22
+Camera 07:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM07%22
+Camera 08:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM08%22
+
+============================================================
+  TIME SYNC
+============================================================
+Precision Time QR (display on laptop, scan before each session):
+  https://gopro.github.io/labs/control/precisiontime/
+
+GPS Time Sync (outdoor only — automatic if GPS has lock):
+  Enabled via GoPro Labs firmware
+
+============================================================
+  NOTES
+============================================================
+- GoPro Labs firmware required on all cameras
+- Hero 10: LCD must be ON for QR code scanning to work
+- ISO locked at 400 — good for controlled indoor lighting.
+  If your scene is too dark/bright, adjust both ISO Min and
+  ISO Max to the same new value.
+- White Balance 4500K is a general indoor default. Measure
+  your actual light color temp and adjust if needed:
+    Tungsten:       ~3200K
+    Fluorescent:    ~4000K
+    Daylight LED:   ~5500K
+- 180° shutter = 1/120s at 60fps (standard cinematic motion
+  blur). For sharper frames with less blur (better for
+  computer vision / feature matching), consider 90° or 45°.
+- Flat color profile preserves dynamic range. Apply LUT or
+  color grade in post.
+- High bit rate maximizes quality at the cost of larger files.
+- No genlock on Hero 10 — use audio clap sync + timecode
+  alignment for frame-accurate multi-cam sync.

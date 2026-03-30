@@ -154,7 +154,7 @@ def main():
 
     cam_files = {}
     for cam in range(1, NUM_CAMS + 1):
-        mp4s = sorted(glob.glob(os.path.join(VIDEO_BASE, str(cam), "GX*.MP4")))
+        mp4s = sorted(glob.glob(os.path.join(VIDEO_BASE, str(cam), "*GX*.MP4")))
         cam_files[cam] = mp4s
         print(f"  Camera {cam}: {len(mp4s)} recordings — {[os.path.basename(f) for f in mp4s]}")
 

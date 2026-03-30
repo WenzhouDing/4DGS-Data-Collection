@@ -2,26 +2,29 @@
 """
 GoPro Hero 10 Intrinsic + Extrinsic Calibration
 ================================================
-Extracts frames from synced multi-camera video into a temp directory,
-auto-detects checkerboard, runs per-camera intrinsic calibration, then
-runs pairwise stereo calibration (each camera vs cam1) for extrinsics.
+Reads synced multi-camera video directly, detects checkerboard corners
+on every frame (or every Nth frame), runs per-camera intrinsic
+calibration, then pairwise stereo calibration (each cam vs cam1).
+
+Only frames with detected corners are saved to disk (for validation).
 
 Outputs:
   output/calibration/
     cam{N}_intrinsics.json       — K, dist, image_size, rms
-    cam{N}_extrinsics.json       — R, T, E, F, stereo_rms (relative to cam1)
+    cam{N}_extrinsics.json       — R, T, E, F, stereo_rms (vs cam1)
     calibration_all_cameras.json — combined intrinsics + extrinsics
     checkerboard_config.json
+    frame_extraction_log.json    — source frame numbers per camera
     validation/
       cam{N}/corners_*.jpg       — corner overlay samples
       cam{N}/reproj_error.png    — per-frame intrinsic error
-      stereo/pair_1_{N}_epipolar_*.jpg — epipolar line validation
-      stereo/stereo_rms.png      — cross-pair RMS chart
-      rms_all_cameras.png        — intrinsic RMS chart
+      stereo/pair_1_{N}_epipolar_*.jpg
+      stereo/stereo_rms.png
+      rms_all_cameras.png
 
 Usage:
-    python run_calibration.py [--base DIR] [--session SESSION] [--cams N]
-                              [--square-size M] [--fps-extract FPS]
+    python run_calibration.py --board 9x12 --square-size 0.03 \\
+        [--base DIR] [--session SESSION] [--cams N] [--every N]
 """
 
 import argparse
@@ -29,10 +32,11 @@ import cv2
 import numpy as np
 import json
 import os
+import sys
 import glob
-import subprocess
 import tempfile
 import shutil
+import time
 
 
 # ─── CLI ──────────────────────────────────────────────────────────
@@ -41,28 +45,45 @@ def parse_args():
         description="Checkerboard intrinsic + extrinsic calibration")
     p.add_argument("--base", default=".",
                    help="Project root (contains output/ folder)")
-    p.add_argument("--session", default="session_04",
+    p.add_argument("--session", default="session_01",
                    help="Session to calibrate from")
     p.add_argument("--cams", type=int, default=5,
                    help="Number of cameras")
-    p.add_argument("--square-size", type=float, default=0.03,
-                   help="Checkerboard square side in metres (default 0.03 = 3 cm)")
-    p.add_argument("--fps-extract", type=float, default=0.5,
-                   help="Extraction rate in fps (default 0.5 = one frame every 2 s)")
+    p.add_argument("--board", required=True,
+                   help="Board size as COLSxROWS in squares, e.g. '9x12'")
+    p.add_argument("--square-size", type=float, required=True,
+                   help="Square side in metres (e.g. 0.03 for 30 mm)")
+    p.add_argument("--every", type=int, default=1,
+                   help="Process every Nth frame (default 1 = all frames). "
+                        "Use 2-5 to speed up at slight quality cost.")
     return p.parse_args()
 
 
-# ─── BOARD CANDIDATES ────────────────────────────────────────────
-BOARD_CANDIDATES = [
-    (9, 6), (8, 6), (7, 5), (8, 5), (7, 4), (6, 4), (10, 7),
-]
-
 VALIDATION_SAMPLE_COUNT = 4
+TOTAL_STEPS = 3
+
+
+# ─── PROGRESS HELPERS ────────────────────────────────────────────
+def step_header(step_num, title):
+    print(f"\n[{step_num}/{TOTAL_STEPS}] {title}")
+    print("=" * 70)
+
+
+def progress(msg, end="\n"):
+    sys.stdout.write(msg + end)
+    sys.stdout.flush()
+
+
+def fmt_time(seconds):
+    """Format seconds as mm:ss or hh:mm:ss."""
+    s = int(seconds)
+    if s < 3600:
+        return f"{s//60}:{s%60:02d}"
+    return f"{s//3600}:{(s%3600)//60:02d}:{s%60:02d}"
 
 
 # ─── VISUALISATION HELPERS ────────────────────────────────────────
 def draw_corner_overlay(img, corners_detected, corners_reprojected, board_size):
-    """Detected corners (green) + reprojected (red circles)."""
     vis = img.copy()
     cv2.drawChessboardCorners(vis, board_size, corners_detected, True)
     for pt in corners_reprojected.reshape(-1, 2):
@@ -71,12 +92,10 @@ def draw_corner_overlay(img, corners_detected, corners_reprojected, board_size):
 
 
 def draw_epipolar_lines(img1, img2, pts1, pts2, F, num_lines=12):
-    """Draw epipolar lines on img2 for points in img1, and vice versa."""
     h, w = img1.shape[:2]
     vis1 = img1.copy()
     vis2 = img2.copy()
 
-    # Subsample points
     n = len(pts1)
     step = max(1, n // num_lines)
     indices = list(range(0, n, step))[:num_lines]
@@ -89,7 +108,6 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F, num_lines=12):
         p1 = pts1[idx].reshape(1, 1, 2).astype(np.float64)
         p2 = pts2[idx].reshape(1, 1, 2).astype(np.float64)
 
-        # Epipolar line in img2 from point in img1
         line2 = cv2.computeCorrespondEpilines(p1, 1, F).reshape(-1, 3)
         a, b, c = line2[0]
         x0, x1 = 0, w
@@ -98,7 +116,6 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F, num_lines=12):
         cv2.line(vis2, (x0, y0), (x1, y1), color, 2)
         cv2.circle(vis2, (int(pts2[idx][0]), int(pts2[idx][1])), 10, color, -1)
 
-        # Epipolar line in img1 from point in img2
         line1 = cv2.computeCorrespondEpilines(p2, 2, F).reshape(-1, 3)
         a, b, c = line1[0]
         y0 = int(-c / b) if abs(b) > 1e-6 else 0
@@ -111,7 +128,6 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F, num_lines=12):
 
 def make_bar_chart(values, labels, title, ylabel, output_path,
                    threshold_colors=None):
-    """Generic bar chart."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -135,7 +151,6 @@ def make_bar_chart(values, labels, title, ylabel, output_path,
 
 
 def make_error_bar_chart(per_frame_errors, cam_label, output_path):
-    """Per-frame reprojection error bar chart."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -158,7 +173,6 @@ def make_error_bar_chart(per_frame_errors, cam_label, output_path):
 
 
 def scale_image(img, target_width=1200):
-    """Resize keeping aspect ratio."""
     h, w = img.shape[:2]
     scale = target_width / w
     return cv2.resize(img, (int(w * scale), int(h * scale)))
@@ -172,7 +186,19 @@ def main():
     SESSION = args.session
     NUM_CAMS = args.cams
     SQUARE_SIZE_M = args.square_size
-    FPS_EXTRACT = args.fps_extract
+    EVERY_N = args.every
+
+    # Parse board size: "9x12" squares -> (8, 11) inner corners
+    parts = args.board.lower().split("x")
+    if len(parts) != 2:
+        print(f"ERROR: --board must be COLSxROWS, e.g. '9x12', got '{args.board}'")
+        raise SystemExit(1)
+    try:
+        board_cols, board_rows = int(parts[0]), int(parts[1])
+    except ValueError:
+        print(f"ERROR: --board values must be integers, got '{args.board}'")
+        raise SystemExit(1)
+    BOARD_SIZE = (board_cols - 1, board_rows - 1)
 
     SYNCED_DIR = os.path.join(BASE, "output", SESSION, "synced_raw")
     OUTPUT = os.path.join(BASE, "output", "calibration")
@@ -182,121 +208,171 @@ def main():
     os.makedirs(VALIDATION, exist_ok=True)
     os.makedirs(STEREO_VAL, exist_ok=True)
 
-    # ── Extract frames to temp dir ────────────────────────────────
+    # Print config
+    print("=" * 70)
+    print("MULTI-CAMERA CALIBRATION")
+    print("=" * 70)
+    print(f"  Session:       {SESSION}")
+    print(f"  Cameras:       {NUM_CAMS}")
+    print(f"  Board:         {board_cols}x{board_rows} squares "
+          f"-> {BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners")
+    print(f"  Square size:   {SQUARE_SIZE_M*1000:.1f} mm")
+    print(f"  Frame skip:    every {EVERY_N} frame(s)"
+          f"{' (all frames)' if EVERY_N == 1 else ''}")
+    print(f"  Synced dir:    {SYNCED_DIR}")
+    print(f"  Output:        {OUTPUT}")
+
+    # Object points
+    objp = np.zeros((BOARD_SIZE[0] * BOARD_SIZE[1], 3), np.float32)
+    objp[:, :2] = np.mgrid[0:BOARD_SIZE[0], 0:BOARD_SIZE[1]].T.reshape(-1, 2)
+    objp *= SQUARE_SIZE_M
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+    # Temp dir for saving only detected frames (for validation images)
     tmpdir = tempfile.mkdtemp(prefix="gopro_calib_")
-    print("=" * 70)
-    print(f"Extracting frames from {SESSION} at {FPS_EXTRACT} fps")
-    print(f"Temp directory: {tmpdir}")
-    print("=" * 70)
 
     try:
-        for cam in range(1, NUM_CAMS + 1):
-            vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
-            if not os.path.exists(vid):
-                print(f"  WARNING: {vid} not found, skipping cam {cam}")
-                continue
-            out_dir = os.path.join(tmpdir, f"cam{cam}")
-            os.makedirs(out_dir, exist_ok=True)
-            subprocess.run([
-                "ffmpeg", "-v", "quiet", "-i", vid,
-                "-vf", f"fps={FPS_EXTRACT}",
-                "-q:v", "2",
-                os.path.join(out_dir, "frame_%04d.jpg"),
-            ], check=True)
-            extracted = glob.glob(os.path.join(out_dir, "*.jpg"))
-            print(f"  Cam {cam}: extracted {len(extracted)} frames")
+        # ══════════════════════════════════════════════════════════
+        # STEP 1: READ VIDEO + DETECT CORNERS (merged for efficiency)
+        # ══════════════════════════════════════════════════════════
+        # Reads directly from video — no ffmpeg extraction step.
+        # Only frames with detected corners are saved to disk.
+        step_header(1, f"Detecting corners ({BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner)")
 
-        # ── Auto-detect board size ────────────────────────────────
-        print("\n" + "=" * 70)
-        print("Auto-detecting checkerboard size...")
-        print("=" * 70)
-
-        detected_board = None
-        test_frames = sorted(glob.glob(os.path.join(tmpdir, "cam1", "*.jpg")))
-
-        for board_size in BOARD_CANDIDATES:
-            hits = 0
-            for fpath in test_frames[:40]:
-                img = cv2.imread(fpath)
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                ret, _ = cv2.findChessboardCorners(
-                    gray, board_size,
-                    cv2.CALIB_CB_ADAPTIVE_THRESH +
-                    cv2.CALIB_CB_NORMALIZE_IMAGE +
-                    cv2.CALIB_CB_FAST_CHECK,
-                )
-                if ret:
-                    hits += 1
-            print(f"  Board {board_size[0]}x{board_size[1]}: "
-                  f"detected in {hits}/{min(len(test_frames), 40)} frames")
-            if hits >= 5 and (detected_board is None or hits > detected_board[1]):
-                detected_board = (board_size, hits)
-
-        if detected_board is None:
-            print("ERROR: Could not detect any checkerboard pattern!")
-            raise SystemExit(1)
-
-        BOARD_SIZE = detected_board[0]
-        print(f"\n  -> Using board size: {BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners "
-              f"({detected_board[1]} detections)")
-
-        # ── Object points ─────────────────────────────────────────
-        objp = np.zeros((BOARD_SIZE[0] * BOARD_SIZE[1], 3), np.float32)
-        objp[:, :2] = np.mgrid[0:BOARD_SIZE[0], 0:BOARD_SIZE[1]].T.reshape(-1, 2)
-        objp *= SQUARE_SIZE_M
-
-        # ── Detect corners in ALL cameras, keyed by frame name ────
-        # This shared structure is used by both intrinsic and extrinsic phases.
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-
-        # cam_corners[cam][frame_name] = (corners_refined, frame_path)
-        cam_corners = {}
+        cam_corners = {}   # cam -> {frame_name: (corners, fpath)}
+        cam_scan_info = {} # cam -> {fps, total, scanned, detected, frame_numbers}
         img_shape = None
 
         for cam in range(1, NUM_CAMS + 1):
+            vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
+            if not os.path.exists(vid):
+                print(f"  Cam {cam}/{NUM_CAMS}: WARNING — {vid} not found")
+                cam_corners[cam] = {}
+                continue
+
+            cap = cv2.VideoCapture(vid)
+            source_fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            if source_fps <= 0 or total_frames <= 0:
+                print(f"  Cam {cam}/{NUM_CAMS}: WARNING — cannot read video")
+                cap.release()
+                cam_corners[cam] = {}
+                continue
+
+            cam_dir = os.path.join(tmpdir, f"cam{cam}")
+            os.makedirs(cam_dir, exist_ok=True)
+
             cam_corners[cam] = {}
-            frames = sorted(glob.glob(os.path.join(tmpdir, f"cam{cam}", "*.jpg")))
             detected = 0
-            for fpath in frames:
-                img = cv2.imread(fpath)
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                if img_shape is None:
-                    img_shape = gray.shape[::-1]  # (w, h)
+            scanned = 0
+            detected_frame_nums = []
+            t0 = time.time()
 
-                ret, corners = cv2.findChessboardCorners(
-                    gray, BOARD_SIZE,
-                    cv2.CALIB_CB_ADAPTIVE_THRESH +
-                    cv2.CALIB_CB_NORMALIZE_IMAGE +
-                    cv2.CALIB_CB_FAST_CHECK,
-                )
-                if ret:
-                    corners_refined = cv2.cornerSubPix(
-                        gray, corners, (11, 11), (-1, -1), criteria
+            frame_num = 0
+            while True:
+                ret = cap.grab()
+                if not ret:
+                    break
+
+                if frame_num % EVERY_N == 0:
+                    ret, img = cap.retrieve()
+                    if not ret:
+                        frame_num += 1
+                        continue
+
+                    scanned += 1
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    if img_shape is None:
+                        img_shape = gray.shape[::-1]
+
+                    ret_cb, corners = cv2.findChessboardCorners(
+                        gray, BOARD_SIZE,
+                        cv2.CALIB_CB_ADAPTIVE_THRESH +
+                        cv2.CALIB_CB_NORMALIZE_IMAGE +
+                        cv2.CALIB_CB_FAST_CHECK,
                     )
-                    fname = os.path.basename(fpath)
-                    cam_corners[cam][fname] = (corners_refined, fpath)
-                    detected += 1
+                    if ret_cb:
+                        corners_refined = cv2.cornerSubPix(
+                            gray, corners, (11, 11), (-1, -1), criteria
+                        )
+                        fname = f"frame_{frame_num:06d}.jpg"
+                        fpath = os.path.join(cam_dir, fname)
+                        cv2.imwrite(fpath, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        cam_corners[cam][fname] = (corners_refined, fpath)
+                        detected += 1
+                        detected_frame_nums.append(frame_num)
 
-            total = len(frames)
-            print(f"  Cam {cam}: detected board in {detected}/{total} frames")
+                    # Progress update every 100 frames
+                    if scanned % 100 == 0 or frame_num == total_frames - 1:
+                        elapsed = time.time() - t0
+                        pct = 100 * frame_num / total_frames
+                        fps_proc = scanned / elapsed if elapsed > 0 else 0
+                        eta = (total_frames - frame_num) / (
+                            frame_num / elapsed) if elapsed > 0 and frame_num > 0 else 0
+                        progress(
+                            f"\r  Cam {cam}/{NUM_CAMS}: "
+                            f"{frame_num}/{total_frames} ({pct:.0f}%)  "
+                            f"{detected} boards found  "
+                            f"[{fps_proc:.0f} fps, ETA {fmt_time(eta)}]"
+                            f"          ",
+                            end="")
+
+                frame_num += 1
+
+            cap.release()
+            elapsed = time.time() - t0
+
+            cam_scan_info[cam] = {
+                "source_fps": source_fps,
+                "total_frames": total_frames,
+                "every_n": EVERY_N,
+                "scanned": scanned,
+                "detected": detected,
+                "frame_numbers": detected_frame_nums,
+                "elapsed_sec": round(elapsed, 1),
+            }
+
+            pct = 100 * detected / scanned if scanned else 0
+            progress(
+                f"\r  Cam {cam}/{NUM_CAMS}: done — "
+                f"{detected}/{scanned} boards detected ({pct:.0f}%)  "
+                f"[{fmt_time(elapsed)}]                         \n",
+                end="")
+
+        if img_shape is None:
+            print("\nERROR: No frames could be read from any camera!")
+            raise SystemExit(1)
+
+        # Detection summary
+        print()
+        total_det = sum(info.get("detected", 0)
+                        for info in cam_scan_info.values())
+        total_scn = sum(info.get("scanned", 0)
+                        for info in cam_scan_info.values())
+        print(f"  Total: {total_det} detections across {NUM_CAMS} cameras "
+              f"({total_scn} frames scanned)")
 
         # ══════════════════════════════════════════════════════════
-        # PHASE 1: INTRINSIC CALIBRATION
+        # STEP 2: INTRINSIC CALIBRATION
         # ══════════════════════════════════════════════════════════
-        print(f"\n{'=' * 70}")
-        print("PHASE 1: INTRINSIC CALIBRATION")
-        print("=" * 70)
+        step_header(2, "Intrinsic calibration")
 
-        intrinsics = {}   # cam -> {K, dist, ...}
+        intrinsics = {}
         cam_rms_map = {}
 
         for cam in range(1, NUM_CAMS + 1):
-            print(f"\n--- Cam {cam} ---")
             corners_dict = cam_corners[cam]
             if len(corners_dict) < 5:
-                print(f"  WARNING: only {len(corners_dict)} detections, need >= 5")
+                print(f"  Cam {cam}/{NUM_CAMS}: SKIP — "
+                      f"only {len(corners_dict)} detections (need >= 5)")
                 intrinsics[cam] = None
                 continue
+
+            progress(
+                f"  Cam {cam}/{NUM_CAMS}: calibrating "
+                f"({len(corners_dict)} frames)...", end="")
 
             frame_names = sorted(corners_dict.keys())
             obj_pts = [objp] * len(frame_names)
@@ -306,7 +382,6 @@ def main():
                 obj_pts, img_pts, img_shape, None, None
             )
 
-            # Per-frame reprojection error
             reproj_errors = []
             reproj_pts = []
             for i in range(len(obj_pts)):
@@ -315,9 +390,6 @@ def main():
                 err = cv2.norm(img_pts[i], proj, cv2.NORM_L2) / len(proj)
                 reproj_errors.append(err)
                 reproj_pts.append(proj)
-
-            print(f"  RMS: {ret:.4f} px | fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
-                  f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}")
 
             intrinsics[cam] = {
                 "K": K, "dist": dist, "rms": ret,
@@ -328,7 +400,13 @@ def main():
             }
             cam_rms_map[f"Cam {cam}"] = ret
 
-            # Save minimal JSON
+            progress(
+                f"\r  Cam {cam}/{NUM_CAMS}: RMS={ret:.4f}px  "
+                f"fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
+                f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}  "
+                f"({len(corners_dict)} frames)          ")
+
+            # Save JSON
             result_json = {
                 "image_size": [img_shape[0], img_shape[1]],
                 "K": K.tolist(),
@@ -338,7 +416,6 @@ def main():
             cam_path = os.path.join(OUTPUT, f"cam{cam}_intrinsics.json")
             with open(cam_path, "w") as f:
                 json.dump(result_json, f, indent=2)
-            print(f"  -> {os.path.basename(cam_path)}")
 
             # Validation: corner overlays
             cam_val_dir = os.path.join(VALIDATION, f"cam{cam}")
@@ -360,11 +437,9 @@ def main():
                 out_path = os.path.join(cam_val_dir, f"corners_{fname}")
                 cv2.imwrite(out_path, vis, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-            # Validation: error bar chart
             chart_path = os.path.join(cam_val_dir, "reproj_error_per_frame.png")
             make_error_bar_chart(reproj_errors, f"Cam {cam}", chart_path)
 
-        # Intrinsic summary chart
         if cam_rms_map:
             make_bar_chart(
                 list(cam_rms_map.values()), list(cam_rms_map.keys()),
@@ -374,15 +449,13 @@ def main():
             )
 
         # ══════════════════════════════════════════════════════════
-        # PHASE 2: EXTRINSIC (STEREO) CALIBRATION
+        # STEP 3: EXTRINSIC (STEREO) CALIBRATION
         # ══════════════════════════════════════════════════════════
-        print(f"\n{'=' * 70}")
-        print("PHASE 2: EXTRINSIC CALIBRATION (each cam vs Cam 1)")
-        print("=" * 70)
+        step_header(3, "Extrinsic calibration (each cam vs Cam 1)")
 
         ref_cam = 1
         if intrinsics[ref_cam] is None:
-            print("ERROR: Reference camera (cam1) intrinsic calibration failed!")
+            print("  ERROR: Cam 1 intrinsic calibration failed!")
             raise SystemExit(1)
 
         K1 = intrinsics[ref_cam]["K"]
@@ -391,32 +464,32 @@ def main():
         stereo_rms_map = {}
 
         for cam in range(2, NUM_CAMS + 1):
-            print(f"\n--- Pair: Cam 1 <-> Cam {cam} ---")
-
             if intrinsics[cam] is None:
-                print(f"  SKIP: cam {cam} intrinsics failed")
+                print(f"  Pair 1-{cam}: SKIP — cam {cam} intrinsics failed")
                 continue
 
             K2 = intrinsics[cam]["K"]
             dist2 = intrinsics[cam]["dist"]
 
-            # Find frames where BOTH cameras detected the board
+            # Match by frame name — encodes source frame number,
+            # so same name = same source frame = same timestamp.
             ref_names = set(cam_corners[ref_cam].keys())
             other_names = set(cam_corners[cam].keys())
             shared = sorted(ref_names & other_names)
 
-            print(f"  Shared frames: {len(shared)} "
-                  f"(cam1: {len(ref_names)}, cam{cam}: {len(other_names)})")
-
             if len(shared) < 8:
-                print(f"  WARNING: need >= 8 shared frames, got {len(shared)}")
+                print(f"  Pair 1-{cam}: SKIP — "
+                      f"{len(shared)} shared frames (need >= 8)")
                 continue
+
+            progress(
+                f"  Pair 1-{cam}: calibrating ({len(shared)} shared)...",
+                end="")
 
             obj_pts_shared = [objp] * len(shared)
             pts1 = [cam_corners[ref_cam][fn][0] for fn in shared]
             pts2 = [cam_corners[cam][fn][0] for fn in shared]
 
-            # stereoCalibrate with fixed intrinsics
             flags = cv2.CALIB_FIX_INTRINSIC
             stereo_criteria = (
                 cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
@@ -431,11 +504,8 @@ def main():
                 flags=flags,
             )
 
-            # Decompose T to get baseline distance
             baseline_m = np.linalg.norm(T)
-            # Rotation as Rodrigues vector + Euler angles
             rvec, _ = cv2.Rodrigues(R)
-            # Euler angles (rough — assumes ZYX)
             sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
             if sy > 1e-6:
                 ex = np.arctan2(R[2, 1], R[2, 2])
@@ -446,13 +516,13 @@ def main():
                 ey = np.arctan2(-R[2, 0], sy)
                 ez = 0
 
-            print(f"  Stereo RMS: {ret:.4f} px")
-            print(f"  Baseline: {baseline_m*100:.2f} cm")
-            print(f"  Translation: [{T[0,0]:.4f}, {T[1,0]:.4f}, {T[2,0]:.4f}] m")
-            print(f"  Euler (deg): rx={np.degrees(ex):.2f} ry={np.degrees(ey):.2f} "
-                  f"rz={np.degrees(ez):.2f}")
-
             stereo_rms_map[f"1-{cam}"] = ret
+
+            progress(
+                f"\r  Pair 1-{cam}: RMS={ret:.4f}px  "
+                f"baseline={baseline_m*100:.2f}cm  "
+                f"T=[{T[0,0]:.4f}, {T[1,0]:.4f}, {T[2,0]:.4f}]m  "
+                f"({len(shared)} shared)          ")
 
             ext_data = {
                 "reference": "cam1",
@@ -475,11 +545,8 @@ def main():
             ext_path = os.path.join(OUTPUT, f"cam{cam}_extrinsics.json")
             with open(ext_path, "w") as f:
                 json.dump(ext_data, f, indent=2)
-            print(f"  -> {os.path.basename(ext_path)}")
 
-            # ── Validation: epipolar lines on sample frames ───────
-            print(f"  Generating epipolar validation...")
-            # Pick 2 sample shared frames
+            # Epipolar validation
             sample_shared = [shared[0], shared[len(shared) // 2]]
             for fn in sample_shared:
                 fpath1 = cam_corners[ref_cam][fn][1]
@@ -487,7 +554,6 @@ def main():
                 img1 = cv2.imread(fpath1)
                 img2 = cv2.imread(fpath2)
 
-                # Use detected corner points for epipolar visualisation
                 c1 = cam_corners[ref_cam][fn][0].reshape(-1, 2)
                 c2 = cam_corners[cam][fn][0].reshape(-1, 2)
 
@@ -502,9 +568,7 @@ def main():
                                   f"pair_1_{cam}_{base}_cam{cam}.jpg")
                 cv2.imwrite(p1, vis1, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 cv2.imwrite(p2, vis2, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                print(f"    -> stereo/pair_1_{cam}_{base}_*.jpg")
 
-        # Stereo RMS summary chart
         if stereo_rms_map:
             make_bar_chart(
                 list(stereo_rms_map.values()),
@@ -518,10 +582,9 @@ def main():
         # SAVE COMBINED FILES
         # ══════════════════════════════════════════════════════════
         print(f"\n{'=' * 70}")
-        print("Saving combined calibration")
+        print("Saving outputs")
         print("=" * 70)
 
-        # Build minimal combined JSON
         cam_data = {}
         for cam in range(1, NUM_CAMS + 1):
             entry = {}
@@ -547,58 +610,76 @@ def main():
             "checkerboard": {
                 "inner_corners": list(BOARD_SIZE),
                 "square_size_m": SQUARE_SIZE_M,
-                "board_squares": [BOARD_SIZE[0] + 1, BOARD_SIZE[1] + 1],
+                "board_squares": [board_cols, board_rows],
             },
             "source_session": SESSION,
             "cameras": cam_data,
         }
-
         combined_path = os.path.join(OUTPUT, "calibration_all_cameras.json")
         with open(combined_path, "w") as f:
             json.dump(combined, f, indent=2)
         print(f"  -> {os.path.basename(combined_path)}")
 
-        # Checkerboard config
         config = {
             "inner_corners": list(BOARD_SIZE),
             "square_size_m": SQUARE_SIZE_M,
-            "board_squares": [BOARD_SIZE[0] + 1, BOARD_SIZE[1] + 1],
+            "board_squares": [board_cols, board_rows],
         }
         config_path = os.path.join(OUTPUT, "checkerboard_config.json")
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
         print(f"  -> {os.path.basename(config_path)}")
 
+        # Frame extraction log — which source frames had detections
+        extraction_log = {}
+        for cam, info in cam_scan_info.items():
+            extraction_log[f"cam{cam}"] = {
+                "source_fps": round(info["source_fps"], 4),
+                "total_source_frames": info["total_frames"],
+                "every_n": info["every_n"],
+                "frames_scanned": info["scanned"],
+                "frames_detected": info["detected"],
+                "detected_frame_numbers": info["frame_numbers"],
+                "elapsed_sec": info["elapsed_sec"],
+            }
+        log_path = os.path.join(OUTPUT, "frame_extraction_log.json")
+        with open(log_path, "w") as f:
+            json.dump(extraction_log, f, indent=2)
+        print(f"  -> {os.path.basename(log_path)}")
+
         # ── Summary ───────────────────────────────────────────────
         print(f"\n{'=' * 70}")
-        print("CALIBRATION SUMMARY")
+        print("CALIBRATION COMPLETE")
         print("=" * 70)
-        print(f"  Board: {BOARD_SIZE[0]+1}x{BOARD_SIZE[1]+1} squares, "
+        print(f"  Board: {board_cols}x{board_rows} squares, "
               f"{BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners, "
-              f"{SQUARE_SIZE_M*100:.0f}cm/square")
+              f"{SQUARE_SIZE_M*1000:.0f}mm/square")
+
         print(f"\n  Intrinsics:")
         for cam in range(1, NUM_CAMS + 1):
             if intrinsics[cam] is None:
                 print(f"    Cam {cam}: FAILED")
             else:
                 K = intrinsics[cam]["K"]
-                print(f"    Cam {cam}: RMS={intrinsics[cam]['rms']:.4f}px "
-                      f"fx={K[0,0]:.1f} fy={K[1,1]:.1f}")
+                n = len(intrinsics[cam]["frame_names"])
+                print(f"    Cam {cam}: RMS={intrinsics[cam]['rms']:.4f}px  "
+                      f"fx={K[0,0]:.1f} fy={K[1,1]:.1f}  ({n} frames)")
+
         print(f"\n  Extrinsics (vs Cam 1):")
         for cam in range(2, NUM_CAMS + 1):
             if cam in extrinsics:
                 e = extrinsics[cam]
-                print(f"    Cam 1 -> Cam {cam}: stereo_rms={e['stereo_rms_px']:.4f}px "
-                      f"baseline={e['baseline_m']*100:.2f}cm")
+                print(f"    Pair 1-{cam}: RMS={e['stereo_rms_px']:.4f}px  "
+                      f"baseline={e['baseline_m']*100:.2f}cm  "
+                      f"({e['shared_frames']} shared)")
             else:
-                print(f"    Cam 1 -> Cam {cam}: FAILED")
+                print(f"    Pair 1-{cam}: FAILED")
 
-        print(f"\nOutput: {OUTPUT}/")
-        print("Done!")
+        print(f"\n  Output: {OUTPUT}/")
+        print("  Done!")
 
     finally:
-        # Clean up temp frames
-        print(f"\nCleaning up temp dir: {tmpdir}")
+        print(f"\n  Cleaning up temp dir...")
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 

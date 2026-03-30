@@ -39,9 +39,22 @@ def parse_args():
 
 
 # ─── CONSTANTS ────────────────────────────────────────────────────
-FPS_FRAC = (60000, 1001)
-FPS = FPS_FRAC[0] / FPS_FRAC[1]  # 59.94
 SAMPLE_RATE = 48000
+
+
+def probe_video_fps(video_path):
+    """Probe actual FPS from video via ffprobe (e.g. 59.94, 119.88)."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0",
+         video_path],
+        capture_output=True, text=True,
+    )
+    fps_str = result.stdout.strip().split("\n")[0]
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        return float(num) / float(den)
+    return float(fps_str)
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────
@@ -208,6 +221,10 @@ def main():
         os.makedirs(synced_dir, exist_ok=True)
         os.makedirs(meta_dir, exist_ok=True)
 
+        # Probe FPS from first camera's video (all cams share same settings)
+        FPS = probe_video_fps(session_files[1]["path"])
+        print(f"\n  Video FPS: {FPS:.4f}")
+
         # Extract audio
         print("\n  Extracting audio...")
         audio_data = {}
@@ -298,7 +315,16 @@ def main():
         filter_str += "[v1][v2][v3]hstack=inputs=3[top];\n"
         filter_str += "[v4][v5]hstack=inputs=2[bot_raw];\n"
         filter_str += "[bot_raw]pad=iw*3/2:ih:0:0:black[bot];\n"
-        filter_str += "[top][bot]vstack=inputs=2[out]"
+        filter_str += "[top][bot]vstack=inputs=2[out];\n"
+
+        # Audio from cam1 (reference), trimmed to match the synced video
+        a_ss = trim_sec[1]
+        a_dur = min(common_dur, PREVIEW_MAX_SEC)
+        if a_ss > 0.0001:
+            filter_str += (f"[0:a]atrim=start={a_ss:.6f}:duration={a_dur},"
+                           f"asetpts=PTS-STARTPTS[aout]")
+        else:
+            filter_str += f"[0:a]atrim=duration={a_dur},asetpts=PTS-STARTPTS[aout]"
 
         preview_path = os.path.join(session_out, f"{session_name}_preview.mp4")
         cmd = ["ffmpeg", "-y", "-v", "quiet"]
@@ -306,9 +332,10 @@ def main():
             cmd += ["-i", src]
         cmd += [
             "-filter_complex", filter_str,
-            "-map", "[out]", "-an",
-            "-t", str(min(common_dur, PREVIEW_MAX_SEC)),
+            "-map", "[out]", "-map", "[aout]",
+            "-t", str(a_dur),
             "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "128k",
             preview_path,
         ]
         try:
@@ -325,7 +352,8 @@ def main():
                     "-t", str(min(common_dur, PREVIEW_MAX_SEC)),
                     "-vf", f"scale=-2:{PREVIEW_HEIGHT}",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "28",
-                    "-an", preview_path,
+                    "-c:a", "aac", "-b:a", "128k",
+                    preview_path,
                 ], check=True)
         except subprocess.TimeoutExpired:
             print("    WARNING: preview generation timed out, skipping")
@@ -372,7 +400,7 @@ def main():
         report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         report.append("## Session Overview")
         report.append(f"- Reference camera: Cam {ref_cam}")
-        report.append(f"- FPS: {FPS:.4f} (59.94)")
+        report.append(f"- FPS: {FPS:.4f}")
         report.append(f"- Audio sample rate: {SAMPLE_RATE} Hz")
         report.append(f"- Common synced duration: {common_dur:.2f}s ({int(common_dur * FPS)} frames)")
         report.append(f"- Number of cameras: {NUM_CAMS}\n")

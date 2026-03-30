@@ -2,9 +2,13 @@
 """
 GoPro Hero 10 Intrinsic + Extrinsic Calibration
 ================================================
-Reads synced multi-camera video directly, detects checkerboard corners
-on every frame (or every Nth frame), runs per-camera intrinsic
-calibration, then pairwise stereo calibration (each cam vs cam1).
+Reads synced multi-camera video directly in lockstep (all cameras
+advance together on the same frame numbers).  Detects checkerboard
+corners using findChessboardCornersSB (sector-based) on downscaled
+frames, with full-resolution cornerSubPix refinement.  Detection is
+parallelised across cameras via ThreadPoolExecutor within each frame.
+Early stopping fires after --max-frames frames where ALL cameras
+detected the board, guaranteeing shared frames for stereo calibration.
 
 Only frames with detected corners are saved to disk (for validation).
 
@@ -37,6 +41,7 @@ import glob
 import tempfile
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ─── CLI ──────────────────────────────────────────────────────────
@@ -53,9 +58,12 @@ def parse_args():
                    help="Board size as COLSxROWS in squares, e.g. '9x12'")
     p.add_argument("--square-size", type=float, required=True,
                    help="Square side in metres (e.g. 0.03 for 30 mm)")
-    p.add_argument("--every", type=int, default=1,
-                   help="Process every Nth frame (default 1 = all frames). "
-                        "Use 2-5 to speed up at slight quality cost.")
+    p.add_argument("--every", type=int, default=30,
+                   help="Process every Nth frame (default 30 = 4fps at 120fps). "
+                        "Use 1 for all frames at the cost of speed.")
+    p.add_argument("--max-frames", type=int, default=60,
+                   help="Stop after this many frames with ALL cameras detecting "
+                        "the board (default 60). 0 = no limit.")
     return p.parse_args()
 
 
@@ -178,6 +186,37 @@ def scale_image(img, target_width=1200):
     return cv2.resize(img, (int(w * scale), int(h * scale)))
 
 
+# ─── CORNER DETECTION ────────────────────────────────────────────
+DETECT_WIDTH = 960  # downscale to this width for findChessboardCornersSB
+
+
+def _detect_frame(gray, board_size):
+    """Detect checkerboard in one frame. Returns refined corners or None.
+
+    Uses findChessboardCornersSB on a downscaled image for speed,
+    then cornerSubPix at full resolution for accuracy.
+    """
+    h, w = gray.shape
+    if w > DETECT_WIDTH:
+        scale = DETECT_WIDTH / w
+        small = cv2.resize(gray, None, fx=scale, fy=scale,
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = gray
+        scale = 1.0
+
+    ret, corners = cv2.findChessboardCornersSB(
+        small, board_size, cv2.CALIB_CB_NORMALIZE_IMAGE)
+    if not ret:
+        return None
+
+    if scale != 1.0:
+        corners /= scale
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                30, 0.001)
+    return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────
 def main():
     args = parse_args()
@@ -187,6 +226,7 @@ def main():
     NUM_CAMS = args.cams
     SQUARE_SIZE_M = args.square_size
     EVERY_N = args.every
+    MAX_FRAMES = args.max_frames
 
     # Parse board size: "9x12" squares -> (8, 11) inner corners
     parts = args.board.lower().split("x")
@@ -219,6 +259,9 @@ def main():
     print(f"  Square size:   {SQUARE_SIZE_M*1000:.1f} mm")
     print(f"  Frame skip:    every {EVERY_N} frame(s)"
           f"{' (all frames)' if EVERY_N == 1 else ''}")
+    print(f"  Max frames:    {MAX_FRAMES} shared (all cams)"
+          f"{' (no limit)' if MAX_FRAMES == 0 else ''}")
+    print(f"  Detect width:  {DETECT_WIDTH}px (downscaled for speed)")
     print(f"  Synced dir:    {SYNCED_DIR}")
     print(f"  Output:        {OUTPUT}")
 
@@ -226,8 +269,6 @@ def main():
     objp = np.zeros((BOARD_SIZE[0] * BOARD_SIZE[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:BOARD_SIZE[0], 0:BOARD_SIZE[1]].T.reshape(-1, 2)
     objp *= SQUARE_SIZE_M
-
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
     # Temp dir for saving only detected frames (for validation images)
     tmpdir = tempfile.mkdtemp(prefix="gopro_calib_")
@@ -240,119 +281,148 @@ def main():
         # Only frames with detected corners are saved to disk.
         step_header(1, f"Detecting corners ({BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner)")
 
-        cam_corners = {}   # cam -> {frame_name: (corners, fpath)}
-        cam_scan_info = {} # cam -> {fps, total, scanned, detected, frame_numbers}
-        img_shape = None
-
+        # Open all video captures
+        caps = {}
+        cam_tmp_dirs = {}
         for cam in range(1, NUM_CAMS + 1):
             vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
             if not os.path.exists(vid):
-                print(f"  Cam {cam}/{NUM_CAMS}: WARNING — {vid} not found")
-                cam_corners[cam] = {}
+                print(f"  WARNING: {vid} not found, skipping")
                 continue
-
             cap = cv2.VideoCapture(vid)
-            source_fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            if source_fps <= 0 or total_frames <= 0:
-                print(f"  Cam {cam}/{NUM_CAMS}: WARNING — cannot read video")
+            if cap.get(cv2.CAP_PROP_FPS) <= 0:
+                print(f"  WARNING: cannot read {vid}, skipping")
                 cap.release()
-                cam_corners[cam] = {}
                 continue
+            caps[cam] = cap
+            cam_tmp_dirs[cam] = os.path.join(tmpdir, f"cam{cam}")
+            os.makedirs(cam_tmp_dirs[cam], exist_ok=True)
 
-            cam_dir = os.path.join(tmpdir, f"cam{cam}")
-            os.makedirs(cam_dir, exist_ok=True)
+        if not caps:
+            print("\nERROR: No valid video files found!")
+            raise SystemExit(1)
 
-            cam_corners[cam] = {}
-            detected = 0
-            scanned = 0
-            detected_frame_nums = []
-            t0 = time.time()
+        source_fps = list(caps.values())[0].get(cv2.CAP_PROP_FPS)
+        total_frames = int(list(caps.values())[0].get(cv2.CAP_PROP_FRAME_COUNT))
 
+        cam_corners = {cam: {} for cam in range(1, NUM_CAMS + 1)}
+        cam_detected_frames = {cam: [] for cam in caps}
+        img_shape = None
+        shared_count = 0
+        scanned = 0
+        t0 = time.time()
+        last_progress = t0
+
+        # Process all cameras in lockstep — same frame number, parallel detection
+        with ThreadPoolExecutor(max_workers=len(caps)) as pool:
             frame_num = 0
-            while True:
-                ret = cap.grab()
-                if not ret:
+            while frame_num < total_frames:
+                # Advance all captures together
+                all_ok = True
+                for cam in caps:
+                    if not caps[cam].grab():
+                        all_ok = False
+                        break
+                if not all_ok:
                     break
 
                 if frame_num % EVERY_N == 0:
-                    ret, img = cap.retrieve()
-                    if not ret:
-                        frame_num += 1
-                        continue
-
                     scanned += 1
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    if img_shape is None:
-                        img_shape = gray.shape[::-1]
 
-                    ret_cb, corners = cv2.findChessboardCorners(
-                        gray, BOARD_SIZE,
-                        cv2.CALIB_CB_ADAPTIVE_THRESH +
-                        cv2.CALIB_CB_NORMALIZE_IMAGE +
-                        cv2.CALIB_CB_FAST_CHECK,
-                    )
-                    if ret_cb:
-                        corners_refined = cv2.cornerSubPix(
-                            gray, corners, (11, 11), (-1, -1), criteria
-                        )
-                        fname = f"frame_{frame_num:06d}.jpg"
-                        fpath = os.path.join(cam_dir, fname)
-                        cv2.imwrite(fpath, img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                        cam_corners[cam][fname] = (corners_refined, fpath)
-                        detected += 1
-                        detected_frame_nums.append(frame_num)
+                    # Retrieve frames from all cameras
+                    imgs = {}
+                    grays = {}
+                    for cam in caps:
+                        ret, img = caps[cam].retrieve()
+                        if ret:
+                            imgs[cam] = img
+                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                            grays[cam] = gray
+                            if img_shape is None:
+                                img_shape = gray.shape[::-1]
 
-                    # Progress update every 100 frames
-                    if scanned % 100 == 0 or frame_num == total_frames - 1:
-                        elapsed = time.time() - t0
+                    # Detect corners across all cameras in parallel
+                    futures = {
+                        pool.submit(_detect_frame, grays[cam], BOARD_SIZE): cam
+                        for cam in grays
+                    }
+                    results = {}
+                    for fut in as_completed(futures):
+                        results[futures[fut]] = fut.result()
+
+                    # Record detections
+                    fname = f"frame_{frame_num:06d}.jpg"
+                    frame_detected = []
+                    for cam, corners in results.items():
+                        if corners is not None:
+                            fpath = os.path.join(cam_tmp_dirs[cam], fname)
+                            cv2.imwrite(fpath, imgs[cam],
+                                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+                            cam_corners[cam][fname] = (corners, fpath)
+                            cam_detected_frames[cam].append(frame_num)
+                            frame_detected.append(cam)
+
+                    if len(frame_detected) == len(caps):
+                        shared_count += 1
+
+                    # Progress (every 0.5s)
+                    now = time.time()
+                    if now - last_progress >= 0.5:
+                        last_progress = now
+                        el = now - t0
+                        fps_p = scanned / el if el > 0 else 0
                         pct = 100 * frame_num / total_frames
-                        fps_proc = scanned / elapsed if elapsed > 0 else 0
-                        eta = (total_frames - frame_num) / (
-                            frame_num / elapsed) if elapsed > 0 and frame_num > 0 else 0
+                        eta = ((total_frames - frame_num)
+                               / (frame_num / el)
+                               if frame_num > 0 and el > 0 else 0)
+                        det_counts = [len(cam_corners[c])
+                                      for c in sorted(caps.keys())]
                         progress(
-                            f"\r  Cam {cam}/{NUM_CAMS}: "
-                            f"{frame_num}/{total_frames} ({pct:.0f}%)  "
-                            f"{detected} boards found  "
-                            f"[{fps_proc:.0f} fps, ETA {fmt_time(eta)}]"
+                            f"\r  {pct:.0f}%  "
+                            f"shared: {shared_count}"
+                            f"{'/' + str(MAX_FRAMES) if MAX_FRAMES > 0 else ''}  "
+                            f"per-cam: {det_counts}  "
+                            f"[{fps_p:.0f} fps, ETA {fmt_time(eta)}]"
                             f"          ",
                             end="")
 
+                    # Early stopping — enough shared detections
+                    if MAX_FRAMES > 0 and shared_count >= MAX_FRAMES:
+                        break
+
                 frame_num += 1
 
-            cap.release()
-            elapsed = time.time() - t0
+        for cam in caps:
+            caps[cam].release()
+        elapsed = time.time() - t0
 
-            cam_scan_info[cam] = {
-                "source_fps": source_fps,
-                "total_frames": total_frames,
-                "every_n": EVERY_N,
-                "scanned": scanned,
-                "detected": detected,
-                "frame_numbers": detected_frame_nums,
-                "elapsed_sec": round(elapsed, 1),
-            }
-
-            pct = 100 * detected / scanned if scanned else 0
-            progress(
-                f"\r  Cam {cam}/{NUM_CAMS}: done — "
-                f"{detected}/{scanned} boards detected ({pct:.0f}%)  "
-                f"[{fmt_time(elapsed)}]                         \n",
-                end="")
+        progress(
+            f"\r  Done — {shared_count} shared detections, "
+            f"{scanned} frames scanned  [{fmt_time(elapsed)}]"
+            f"                              \n", end="")
 
         if img_shape is None:
             print("\nERROR: No frames could be read from any camera!")
             raise SystemExit(1)
 
+        # Build scan info for extraction log
+        cam_scan_info = {}
+        for cam in range(1, NUM_CAMS + 1):
+            cam_scan_info[cam] = {
+                "source_fps": source_fps if cam in caps else 0,
+                "total_frames": total_frames if cam in caps else 0,
+                "every_n": EVERY_N,
+                "scanned": scanned if cam in caps else 0,
+                "detected": len(cam_corners[cam]),
+                "frame_numbers": cam_detected_frames.get(cam, []),
+                "elapsed_sec": round(elapsed, 1),
+            }
+
         # Detection summary
         print()
-        total_det = sum(info.get("detected", 0)
-                        for info in cam_scan_info.values())
-        total_scn = sum(info.get("scanned", 0)
-                        for info in cam_scan_info.values())
+        total_det = sum(len(cam_corners[c]) for c in range(1, NUM_CAMS + 1))
         print(f"  Total: {total_det} detections across {NUM_CAMS} cameras "
-              f"({total_scn} frames scanned)")
+              f"({scanned} frames scanned, {shared_count} shared)")
 
         # ══════════════════════════════════════════════════════════
         # STEP 2: INTRINSIC CALIBRATION

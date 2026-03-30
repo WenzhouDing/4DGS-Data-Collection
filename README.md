@@ -8,11 +8,11 @@ Frame-accurate sync, intrinsic calibration, and extrinsic (stereo) calibration p
 
 **Calibration pipeline** (`run_calibration.py`) — Two-phase calibration from a synced checkerboard session:
 
-1. **Intrinsic calibration** — Reads every frame directly from the synced video via OpenCV, detects checkerboard corners on the fly, then runs `cv2.calibrateCamera()` per camera. Only frames with detected corners are saved to disk. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
+1. **Intrinsic calibration** — All cameras are read in lockstep (same frame numbers) via OpenCV. For each sampled frame, checkerboard detection runs in parallel across cameras using `findChessboardCornersSB` (sector-based, faster than classic) on downscaled frames (~960px wide), then refines at full resolution via `cornerSubPix`. Early stopping fires after `--max-frames` (default 60) frames where ALL cameras detected the board. Each camera's detections then go through `cv2.calibrateCamera()`. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
 
-2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both Camera 1 (reference) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS.
+2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both Camera 1 (reference) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Because detection uses the same frame numbers across cameras (lockstep), shared frames are guaranteed to be truly time-synced. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS.
 
-Both phases share the same corner detections. Source frame numbers are embedded in filenames (e.g. `frame_000120.jpg` = source frame 120), so matching by filename guarantees temporal correspondence across synced cameras. Detected frames go to a system temp directory and are automatically cleaned up.
+Both phases share the same corner detections. Source frame numbers are embedded in filenames (e.g. `frame_000120.jpg` = source frame 120), so matching by filename guarantees temporal correspondence across synced cameras. The lockstep approach ensures all cameras process identical frame numbers — this is critical for stereo calibration accuracy. Detected frames go to a system temp directory and are automatically cleaned up.
 
 ## Directory Layout
 
@@ -138,13 +138,14 @@ python run_calibration.py --board 9x12 --square-size 0.03 --base . --session ses
 | `--base` | `.` | Project root |
 | `--session` | `session_01` | Which synced session to calibrate from |
 | `--cams` | `5` | Number of cameras |
-| `--every` | `1` | Process every Nth frame (1 = all frames, 2 = half, etc.) |
+| `--every` | `30` | Process every Nth frame (30 = ~4fps at 120fps, 1 = all) |
+| `--max-frames` | `60` | Stop after this many frames where ALL cameras detected the board (0 = no limit) |
 
 ### Phase 1: Intrinsic Calibration
 
-The script reads directly from each camera's synced video via `cv2.VideoCapture`, processing every frame (or every Nth if `--every` is set). Only frames where the checkerboard is detected are saved to disk. The board size is specified via `--board` (e.g. `9x12` = 9 columns × 12 rows of squares → 8×11 inner corners).
+All cameras are read in lockstep — every camera advances to the same frame number together. For each sampled frame (`--every`, default 30), all cameras retrieve and decode the frame, then `cv2.findChessboardCornersSB` runs in parallel across cameras via `ThreadPoolExecutor`. For 4K frames, detection runs on a downscaled image (~960px wide), then corners are refined at full resolution via `cornerSubPix`. Early stopping fires after `--max-frames` (default 60) frames where ALL cameras detected the board — this guarantees enough shared frames for stereo calibration. Only frames where the checkerboard is detected are saved to disk. The board size is specified via `--board` (e.g. `9x12` = 9 columns × 12 rows of squares → 8×11 inner corners).
 
-For each camera, all frames where the board was detected go through subpixel corner refinement (`cv2.cornerSubPix`) and then into `cv2.calibrateCamera()`. The output per camera is a minimal JSON:
+Detected frames go through `cv2.calibrateCamera()`. The output per camera is a minimal JSON:
 
 ```json
 {
@@ -159,7 +160,7 @@ For each camera, all frames where the board was detected go through subpixel cor
 
 ### Phase 2: Extrinsic (Stereo) Calibration
 
-Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same source frame number. Since the videos are time-synced and frame numbers are embedded in filenames (e.g. `frame_000120.jpg`), matching filenames means matching physical moments, which means the board was in the same pose.
+Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same source frame number. Because Phase 1 processes all cameras in lockstep on the same frame numbers, shared frames are guaranteed to be truly time-synced (same physical moment, board in same pose). With `--max-frames 60`, at least 60 such shared frames are guaranteed for every camera pair.
 
 For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The output per pair:
 

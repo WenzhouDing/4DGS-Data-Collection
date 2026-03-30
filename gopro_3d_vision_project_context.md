@@ -155,8 +155,9 @@ Play back synced videos and confirm the clap frame aligns visually across all ca
 ### Accuracy Notes
 
 - Audio sync at 48kHz sample rate → ~0.02ms per sample, well within one frame at 120fps (~8.3ms)
-- Cross-correlation (`np.correlate`) is more robust than peak detection in noisy environments
+- Cross-correlation (`scipy.signal.correlate`) is more robust than peak detection in noisy environments
 - GoPro Hero 10 has NO genlock — over long recordings (10+ min) cameras can drift by 1-2 frames. Clap at both ends to detect drift. If significant, resample/interpolate.
+- Calibration pipeline reads synced videos in lockstep (all cameras on same frame number) — this guarantees stereo calibration pairs see the board in the same pose. Detection is parallelised across cameras within each frame using `findChessboardCornersSB` on downscaled images (~960px), with `cornerSubPix` refinement at full 4K resolution.
 
 ---
 
@@ -208,5 +209,7 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 
 ## 8. FILES DELIVERED
 
+- `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, preview grid)
+- `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping)
 - `gopro_hero10_3d_rig_config.txt` — The full camera config with QR URLs, all params, per-camera naming URLs, time sync links, and operational notes
 - `gopro_3d_vision_project_context.md` — This file (full context dump for agent handoff)

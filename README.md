@@ -4,15 +4,15 @@ Frame-accurate sync, intrinsic calibration, and extrinsic (stereo) calibration p
 
 ## What This Does
 
-**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid, per-session metadata JSON, and a sync report with sanity checks.
+**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid with audio, per-session metadata JSON, and a sync report with sanity checks. FPS is probed from the actual video (supports 60fps, 120fps, etc.).
 
 **Calibration pipeline** (`run_calibration.py`) — Two-phase calibration from a synced checkerboard session:
 
-1. **Intrinsic calibration** — Extracts frames to a temp directory, auto-detects checkerboard geometry, runs `cv2.calibrateCamera()` per camera. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
+1. **Intrinsic calibration** — Reads every frame directly from the synced video via OpenCV, detects checkerboard corners on the fly, then runs `cv2.calibrateCamera()` per camera. Only frames with detected corners are saved to disk. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
 
 2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both Camera 1 (reference) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS.
 
-Both phases share the same corner detections — frame indices correspond across synced cameras, so matching is by filename. Extracted frames go to a system temp directory and are automatically cleaned up after calibration finishes.
+Both phases share the same corner detections. Source frame numbers are embedded in filenames (e.g. `frame_000120.jpg` = source frame 120), so matching by filename guarantees temporal correspondence across synced cameras. Detected frames go to a system temp directory and are automatically cleaned up.
 
 ## Directory Layout
 
@@ -42,6 +42,7 @@ Both phases share the same corner detections — frame indices correspond across
         ├── cam2_extrinsics.json ... cam5_extrinsics.json
         ├── calibration_all_cameras.json
         ├── checkerboard_config.json
+        ├── frame_extraction_log.json   # source frame numbers used per cam
         └── validation/
             ├── cam1/ ... cam5/
             │   ├── corners_frame_*.jpg     # detected vs reprojected corners
@@ -69,14 +70,14 @@ pip install -r requirements.txt
 All cameras must share identical settings so that footage is directly comparable. The file `gopro_hero10_3d_rig_config.txt` has the full parameter list and a GoPro Labs QR code command string you can flash to every camera:
 
 ```
-mVr4p60e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
+mVr4p120e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
 ```
 
-Key settings: 4K 60fps, Wide lens, Flat color, 10-bit, ISO locked at 400, 180-degree shutter, Hypersmooth off.
+Key settings: 4K 120fps, Wide lens, Flat color, 10-bit, ISO locked at 400, 180-degree shutter, Hypersmooth off. The pipeline auto-detects the actual FPS from video metadata.
 
 Generate a scannable QR at:
 ```
-https://gopro.github.io/labs/control/set/?cmd=mVr4p60e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
+https://gopro.github.io/labs/control/set/?cmd=mVr4p120e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
 ```
 
 See the config file for per-camera naming QR codes (`!MBASE`) and time sync options (Precision Time QR, GPS).
@@ -127,20 +128,21 @@ Record a session where a checkerboard is clearly visible from all cameras, then 
 
 ```bash
 python sync_pipeline.py --base . --cams 5
-python run_calibration.py --base . --session session_04 --square-size 0.03
+python run_calibration.py --board 9x12 --square-size 0.03 --base . --session session_01 --cams 5
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--board` | *required* | Board size as COLSxROWS in squares, e.g. `9x12` |
+| `--square-size` | *required* | Checkerboard square side in metres (e.g. `0.03` for 30 mm) |
 | `--base` | `.` | Project root |
-| `--session` | `session_04` | Which synced session to calibrate from |
+| `--session` | `session_01` | Which synced session to calibrate from |
 | `--cams` | `5` | Number of cameras |
-| `--square-size` | `0.03` | Checkerboard square side in metres |
-| `--fps-extract` | `0.5` | Frame extraction rate (0.5 = one frame every 2 s) |
+| `--every` | `1` | Process every Nth frame (1 = all frames, 2 = half, etc.) |
 
 ### Phase 1: Intrinsic Calibration
 
-The script extracts frames from each camera's synced video into a system temp directory (automatically cleaned up when the script finishes). It then auto-detects the checkerboard by trying several inner-corner candidates against frames from Camera 1. Whichever board size gets the most detections wins.
+The script reads directly from each camera's synced video via `cv2.VideoCapture`, processing every frame (or every Nth if `--every` is set). Only frames where the checkerboard is detected are saved to disk. The board size is specified via `--board` (e.g. `9x12` = 9 columns × 12 rows of squares → 8×11 inner corners).
 
 For each camera, all frames where the board was detected go through subpixel corner refinement (`cv2.cornerSubPix`) and then into `cv2.calibrateCamera()`. The output per camera is a minimal JSON:
 
@@ -157,7 +159,7 @@ For each camera, all frames where the board was detected go through subpixel cor
 
 ### Phase 2: Extrinsic (Stereo) Calibration
 
-Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same frame index. Since the videos are time-synced, matching frame indices means matching physical moments, which means the board was in the same pose.
+Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same source frame number. Since the videos are time-synced and frame numbers are embedded in filenames (e.g. `frame_000120.jpg`), matching filenames means matching physical moments, which means the board was in the same pose.
 
 For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The output per pair:
 

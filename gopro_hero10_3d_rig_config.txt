@@ -4,10 +4,10 @@
 ============================================================
 
 QR CODE COMMAND STRING:
-  mVr4p60e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
+  mVr4p120e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
 
 QR CODE URL (open in browser, scan with camera):
-  https://gopro.github.io/labs/control/set/?cmd=mVr4p60e0!NfL0thS0dR0aScFd1b1w45i4M4S180x0sLa
+  https://gopro.github.io/labs/control/set/?cmd=mVr4p120e0!NfW0thS0dR0aScFd1b1w45i4M4S180x0sLa
 
 QR CODE CREATOR PAGE (to modify settings):
   https://gopro.github.io/labs/control/custom/
@@ -17,7 +17,7 @@ QR CODE CREATOR PAGE (to modify settings):
 ============================================================
 Camera Mode:       Video
 Video Resolution:  4K (16:9)
-Frame Rate:        60 fps
+Frame Rate:        120 fps
 Hypersmooth:       Off
 Lens / FOV:        Wide
 Hindsight:         Off
@@ -33,7 +33,7 @@ Bit Rate:          High
 White Balance:     4500K (fixed — adjust to match your lights)
 ISO Min:           400
 ISO Max:           400 (locked — both min and max = 400)
-Lock Shutter:      180° (= 1/120s at 60fps)
+Lock Shutter:      180° (= 1/240s at 120fps)
 EV Compensation:   0
 Sharpness:         Low
 RAW Audio:         Off
@@ -72,7 +72,7 @@ GPS Time Sync (outdoor only — automatic if GPS has lock):
     Tungsten:       ~3200K
     Fluorescent:    ~4000K
     Daylight LED:   ~5500K
-- 180° shutter = 1/120s at 60fps (standard cinematic motion
+- 180° shutter = 1/240s at 120fps (standard cinematic motion
   blur). For sharper frames with less blur (better for
   computer vision / feature matching), consider 90° or 45°.
 - Flat color profile preserves dynamic range. Apply LUT or

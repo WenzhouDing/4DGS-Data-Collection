@@ -158,6 +158,7 @@ Play back synced videos and confirm the clap frame aligns visually across all ca
 - Cross-correlation (`scipy.signal.correlate`) is more robust than peak detection in noisy environments
 - GoPro Hero 10 has NO genlock — over long recordings (10+ min) cameras can drift by 1-2 frames. Clap at both ends to detect drift. If significant, resample/interpolate.
 - Calibration pipeline reads synced videos in lockstep (all cameras on same frame number) — this guarantees stereo calibration pairs see the board in the same pose. Detection is parallelised across cameras within each frame using `findChessboardCornersSB` on downscaled images (~960px), with `cornerSubPix` refinement at full 4K resolution.
+- Extrinsic R, T are expressed as **camN's pose in cam1's frame** (cam1 = origin). OpenCV's `stereoCalibrate` returns the inverse convention, so the output is inverted: `R_inv = R^T`, `T_inv = -R^T · T`.
 
 ---
 

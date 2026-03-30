@@ -574,16 +574,21 @@ def main():
                 flags=flags,
             )
 
-            baseline_m = np.linalg.norm(T)
-            rvec, _ = cv2.Rodrigues(R)
-            sy = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+            # Invert to get camN's pose in cam1's frame
+            # stereoCalibrate gives P_camN = R * P_cam1 + T
+            # We want camN in cam1: R_inv = R^T, T_inv = -R^T * T
+            R_inv = R.T
+            T_inv = -R.T @ T
+
+            baseline_m = np.linalg.norm(T_inv)
+            sy = np.sqrt(R_inv[0, 0]**2 + R_inv[1, 0]**2)
             if sy > 1e-6:
-                ex = np.arctan2(R[2, 1], R[2, 2])
-                ey = np.arctan2(-R[2, 0], sy)
-                ez = np.arctan2(R[1, 0], R[0, 0])
+                ex = np.arctan2(R_inv[2, 1], R_inv[2, 2])
+                ey = np.arctan2(-R_inv[2, 0], sy)
+                ez = np.arctan2(R_inv[1, 0], R_inv[0, 0])
             else:
-                ex = np.arctan2(-R[1, 2], R[1, 1])
-                ey = np.arctan2(-R[2, 0], sy)
+                ex = np.arctan2(-R_inv[1, 2], R_inv[1, 1])
+                ey = np.arctan2(-R_inv[2, 0], sy)
                 ez = 0
 
             stereo_rms_map[f"1-{cam}"] = ret
@@ -591,14 +596,14 @@ def main():
             progress(
                 f"\r  Pair 1-{cam}: RMS={ret:.4f}px  "
                 f"baseline={baseline_m*100:.2f}cm  "
-                f"T=[{T[0,0]:.4f}, {T[1,0]:.4f}, {T[2,0]:.4f}]m  "
+                f"T=[{T_inv[0,0]:.4f}, {T_inv[1,0]:.4f}, {T_inv[2,0]:.4f}]m  "
                 f"({len(shared)} shared)          ")
 
             ext_data = {
                 "reference": "cam1",
                 "target": f"cam{cam}",
-                "R": R.tolist(),
-                "T": T.flatten().tolist(),
+                "R": R_inv.tolist(),
+                "T": T_inv.flatten().tolist(),
                 "E": E.tolist(),
                 "F": F.tolist(),
                 "stereo_rms_px": round(ret, 6),

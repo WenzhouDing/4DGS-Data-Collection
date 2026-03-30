@@ -162,7 +162,7 @@ Detected frames go through `cv2.calibrateCamera()`. The output per camera is a m
 
 Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same source frame number. Because Phase 1 processes all cameras in lockstep on the same frame numbers, shared frames are guaranteed to be truly time-synced (same physical moment, board in same pose). With `--max-frames 60`, at least 60 such shared frames are guaranteed for every camera pair.
 
-For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The output per pair:
+For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The raw stereoCalibrate output is inverted so that R and T express **camN's pose in cam1's coordinate frame** (cam1 = origin). The output per pair:
 
 ```json
 {
@@ -179,7 +179,7 @@ For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INT
 }
 ```
 
-`R` is the 3x3 rotation matrix from cam1's coordinate system to camN. `T` is the translation vector in metres — its norm is the baseline distance between the two cameras. `E` and `F` are the essential and fundamental matrices. `stereo_rms_px` is the stereo reprojection error (how well the geometry fits the observed correspondences). `euler_deg` decomposes R into ZYX Euler angles for quick sanity checking.
+`R` is the 3x3 rotation of camN relative to cam1. `T` is camN's optical center position in cam1's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from cam1's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R into ZYX Euler angles for quick sanity checking.
 
 The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters.
 

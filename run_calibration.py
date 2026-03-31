@@ -621,16 +621,20 @@ def main():
             with open(ext_path, "w") as f:
                 json.dump(ext_data, f, indent=2)
 
-            # Epipolar validation
+            # Epipolar validation — undistort images and points so F is valid
             sample_shared = [shared[0], shared[len(shared) // 2]]
             for fn in sample_shared:
                 fpath1 = cam_corners[ref_cam][fn][1]
                 fpath2 = cam_corners[cam][fn][1]
-                img1 = cv2.imread(fpath1)
-                img2 = cv2.imread(fpath2)
+                img1 = cv2.undistort(cv2.imread(fpath1), K1, dist1)
+                img2 = cv2.undistort(cv2.imread(fpath2), K2, dist2)
 
-                c1 = cam_corners[ref_cam][fn][0].reshape(-1, 2)
-                c2 = cam_corners[cam][fn][0].reshape(-1, 2)
+                c1 = cv2.undistortPoints(
+                    cam_corners[ref_cam][fn][0].reshape(-1, 1, 2),
+                    K1, dist1, P=K1).reshape(-1, 2)
+                c2 = cv2.undistortPoints(
+                    cam_corners[cam][fn][0].reshape(-1, 1, 2),
+                    K2, dist2, P=K2).reshape(-1, 2)
 
                 vis1, vis2 = draw_epipolar_lines(img1, img2, c1, c2, F)
                 vis1 = scale_image(vis1)

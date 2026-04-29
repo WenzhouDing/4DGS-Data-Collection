@@ -57,13 +57,15 @@ Raw footage folders (`1/`, `2/`, ...) and `output/` are gitignored — only the 
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.12+ (managed via [uv](https://docs.astral.sh/uv/))
 - ffmpeg and ffprobe on PATH
 - GoPro Labs firmware on all cameras (for QR code configuration)
 
 ```bash
-pip install -r requirements.txt
+uv sync   # creates .venv/ from pyproject.toml + uv.lock
 ```
+
+Run any script with `uv run python <script>.py …` (or activate `.venv/` manually).
 
 ## Camera Setup
 

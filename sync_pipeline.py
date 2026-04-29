@@ -51,10 +51,18 @@ def probe_video_fps(video_path):
         capture_output=True, text=True,
     )
     fps_str = result.stdout.strip().split("\n")[0]
-    if "/" in fps_str:
-        num, den = fps_str.split("/")
-        return float(num) / float(den)
-    return float(fps_str)
+    if not fps_str:
+        raise RuntimeError(
+            f"ffprobe could not read fps from {video_path} "
+            f"(rc={result.returncode}, stderr={result.stderr.strip()!r})")
+    try:
+        if "/" in fps_str:
+            num, den = fps_str.split("/")
+            return float(num) / float(den)
+        return float(fps_str)
+    except ValueError as e:
+        raise RuntimeError(
+            f"ffprobe returned unparseable fps {fps_str!r} for {video_path}") from e
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────
@@ -172,6 +180,13 @@ def main():
         print(f"  Camera {cam}: {len(mp4s)} recordings — {[os.path.basename(f) for f in mp4s]}")
 
     # Pair by recording order (not filename — cameras may have different numbering)
+    empty_cams = [cam for cam, mp4s in cam_files.items() if not mp4s]
+    if empty_cams:
+        print(f"\nERROR: no GX*.MP4 files found in folder(s) {empty_cams} "
+              f"under {VIDEO_BASE}.")
+        print("  Check --base, --cams, and that each camera's SD card has "
+              "been copied into the matching numbered folder.")
+        raise SystemExit(1)
     num_sessions = min(len(v) for v in cam_files.values())
     print(f"\n  -> {num_sessions} complete sessions (all {NUM_CAMS} cameras present)")
 
@@ -182,11 +197,14 @@ def main():
         for cam in range(1, NUM_CAMS + 1):
             fpath = cam_files[cam][s]
             fname = os.path.basename(fpath)
-            dur = float(subprocess.run(
+            dur_out = subprocess.run(
                 ["ffprobe", "-v", "quiet", "-show_entries",
                  "format=duration", "-of", "csv=p=0", fpath],
                 capture_output=True, text=True,
-            ).stdout.strip())
+            ).stdout.strip()
+            if not dur_out:
+                raise RuntimeError(f"ffprobe could not read duration from {fpath}")
+            dur = float(dur_out)
             session_files[cam] = {"path": fpath, "filename": fname, "duration": dur}
 
         for cam in range(1, NUM_CAMS + 1):
@@ -207,7 +225,7 @@ def main():
             f = session_files[cam]
             print(f"    Cam {cam}: {f['filename']}  {f['duration']:.2f}s  "
                   f"LRV={'Y' if f['lrv_path'] else 'N'}  THM={'Y' if f['thm_path'] else 'N'}")
-        print(f"    Duration spread: {dur_spread:.2f}s {'!! LARGE SPREAD' if dur_spread > 5 else 'OK'}")
+        print(f"    Raw duration spread: {dur_spread:.2f}s {'!! LARGE SPREAD' if dur_spread > 5 else 'OK'}")
 
     # ── 2. Process each session ───────────────────────────────────
     for session_name, session_files in sessions.items():
@@ -445,7 +463,7 @@ def main():
              "PASS" if min_conf > 0.3 else "FAIL", f"min={min_conf:.4f}"),
             ("Max offset < 5000ms",
              "PASS" if max_offset_ms < 5000 else "WARN", f"{max_offset_ms:.1f}ms"),
-            ("Duration spread < 10s",
+            ("Raw duration spread < 10s",
              "PASS" if dur_spread < 10 else "WARN", f"{dur_spread:.2f}s"),
             ("All cameras present",
              "PASS" if len(session_files) == NUM_CAMS else "FAIL",

@@ -165,7 +165,14 @@ def main():
     NUM_FRAMES = args.num_frames
 
     parts = args.board.lower().split("x")
-    board_cols, board_rows = int(parts[0]), int(parts[1])
+    if len(parts) != 2:
+        print(f"ERROR: --board must be COLSxROWS, e.g. '9x12', got '{args.board}'")
+        raise SystemExit(1)
+    try:
+        board_cols, board_rows = int(parts[0]), int(parts[1])
+    except ValueError:
+        print(f"ERROR: --board values must be integers, got '{args.board}'")
+        raise SystemExit(1)
     BOARD_SIZE = (board_cols - 1, board_rows - 1)
 
     CALIB_DIR = os.path.join(BASE, "output", "calibration")
@@ -187,6 +194,10 @@ def main():
     print(f"  Loaded:      {len(cams)} cameras")
 
     ref_cam = 1
+    if ref_cam not in cams:
+        print(f"\nERROR: cam{ref_cam} calibration not found in {CALIB_DIR}.")
+        print(f"  Expected: cam{ref_cam}_intrinsics.json")
+        raise SystemExit(1)
     K1 = cams[ref_cam]["K"]
     dist1 = cams[ref_cam]["dist"]
 
@@ -194,10 +205,21 @@ def main():
     caps = {}
     for cam in range(1, NUM_CAMS + 1):
         vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
-        if os.path.exists(vid):
-            caps[cam] = cv2.VideoCapture(vid)
+        if not os.path.exists(vid):
+            continue
+        cap = cv2.VideoCapture(vid)
+        if not cap.isOpened():
+            print(f"  WARNING: cannot open {vid}, skipping")
+            cap.release()
+            continue
+        caps[cam] = cap
 
-    total_frames = int(list(caps.values())[0].get(cv2.CAP_PROP_FRAME_COUNT))
+    if ref_cam not in caps:
+        print(f"\nERROR: synced video for cam{ref_cam} not found in {SYNCED_DIR}.")
+        print(f"  Expected: cam{ref_cam}_synced.mp4")
+        raise SystemExit(1)
+
+    total_frames = int(caps[ref_cam].get(cv2.CAP_PROP_FRAME_COUNT))
 
     # Sample frame indices evenly across the video
     sample_indices = np.linspace(
@@ -227,7 +249,12 @@ def main():
         vis_saved = 0
 
         for fi, target_frame in enumerate(sample_indices):
-            # Seek both captures to the same frame
+            # Seek both captures to the same frame.
+            # Note: CAP_PROP_POS_FRAMES on H.264 stream-copied video can land
+            # 1-2 frames off the requested index because the GOP layout from
+            # the source is preserved. This is fine for a static checkerboard
+            # but inflates epipolar error when the board is moving — pair
+            # frames by reading sequentially if you change this code path.
             caps[ref_cam].set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             caps[cam].set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             ret1, img1 = caps[ref_cam].read()

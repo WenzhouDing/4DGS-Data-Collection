@@ -179,7 +179,7 @@ For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INT
 }
 ```
 
-`R` is the 3x3 rotation of camN relative to cam1. `T` is camN's optical center position in cam1's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from cam1's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R into ZYX Euler angles for quick sanity checking.
+`R` is the 3x3 rotation of camN relative to cam1. `T` is camN's optical center position in cam1's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from cam1's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only.
 
 The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters.
 

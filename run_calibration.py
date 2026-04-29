@@ -313,17 +313,25 @@ def main():
         t0 = time.time()
         last_progress = t0
 
-        # Process all cameras in lockstep — same frame number, parallel detection
+        # Process all cameras in lockstep — same frame number, parallel detection.
+        # If any camera can't grab a frame, lockstep is broken — stop rather
+        # than silently skip, since mismatched frame indices would corrupt
+        # stereo correspondences.
         with ThreadPoolExecutor(max_workers=len(caps)) as pool:
             frame_num = 0
+            failed_cam = None
             while frame_num < total_frames:
                 # Advance all captures together
                 all_ok = True
                 for cam in caps:
                     if not caps[cam].grab():
+                        failed_cam = cam
                         all_ok = False
                         break
                 if not all_ok:
+                    print(f"\n  Cam {failed_cam}: grab() failed at frame "
+                          f"{frame_num}/{total_frames} — stopping detection "
+                          f"(this is normal at end-of-stream).")
                     break
 
                 if frame_num % EVERY_N == 0:
@@ -448,9 +456,15 @@ def main():
             obj_pts = [objp] * len(frame_names)
             img_pts = [corners_dict[fn][0] for fn in frame_names]
 
-            ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-                obj_pts, img_pts, img_shape, None, None
-            )
+            try:
+                ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+                    obj_pts, img_pts, img_shape, None, None
+                )
+            except cv2.error as e:
+                print(f"\r  Cam {cam}/{NUM_CAMS}: FAILED — calibrateCamera "
+                      f"raised: {e}                                   ")
+                intrinsics[cam] = None
+                continue
 
             reproj_errors = []
             reproj_pts = []
@@ -566,13 +580,18 @@ def main():
                 100, 1e-6,
             )
 
-            ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
-                obj_pts_shared, pts1, pts2,
-                K1, dist1, K2, dist2,
-                img_shape,
-                criteria=stereo_criteria,
-                flags=flags,
-            )
+            try:
+                ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+                    obj_pts_shared, pts1, pts2,
+                    K1, dist1, K2, dist2,
+                    img_shape,
+                    criteria=stereo_criteria,
+                    flags=flags,
+                )
+            except cv2.error as e:
+                print(f"\r  Pair 1-{cam}: FAILED — stereoCalibrate "
+                      f"raised: {e}                                   ")
+                continue
 
             # Invert to get camN's pose in cam1's frame
             # stereoCalibrate gives P_camN = R * P_cam1 + T

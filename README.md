@@ -99,28 +99,29 @@ See the config file for per-camera naming QR codes (`!MBASE`) and time sync opti
 From the project root (the directory containing folders `1/`, `2/`, ...):
 
 ```bash
-python sync_pipeline.py --base . --cams 5
+uv run python sync_pipeline.py --base . --cams 12
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `.` | Directory containing camera folders `1/` through `N/` |
-| `--cams` | `5` | Number of cameras |
+| `--cams` | `12` | Number of cameras |
+| `--ref-cam` | `1` | Reference camera (cross-correlation reference + preview audio source) |
 | `--search-window` | `15` | Seconds of audio to search for the clap |
 | `--preview-height` | `360` | Per-camera height in the preview grid (px) |
 | `--preview-max-sec` | `30` | Max duration of the preview clip |
 
 The pipeline:
-1. Discovers GoPro MP4s in each camera folder and pairs them **by recording order** (not filename — cameras may start numbering differently).
-2. Extracts audio, runs `scipy.signal.correlate()` against Camera 1 as reference.
+1. Discovers GoPro MP4s in each camera folder and pairs them **by recording order** (not filename — cameras may start numbering differently and may even have different file counts; mismatched extras are dropped).
+2. Extracts audio, runs `scipy.signal.correlate()` against the reference camera (`--ref-cam`).
 3. Computes per-camera trim offsets and a common duration.
 4. Stream-copies (`-c copy`) each camera's video with the computed trim — no quality loss.
-5. Generates a 3+2 grid preview from LRV proxy files (falls back to scaled MP4 if LRV missing).
+5. Generates an N-camera grid preview from LRV proxy files (falls back to scaled MP4 if LRV missing). The grid is auto-laid-out as `cols × rows` with `cols = ceil(sqrt(N))`.
 6. Writes a sync report with sanity checks (confidence, offset magnitude, duration spread).
 
 ### How Sync Works
 
-Each camera is started manually, so recording start times differ by several seconds. A single clap provides a sharp audio transient visible in all recordings. Cross-correlation finds the precise sample offset between Camera 1's audio and every other camera. The camera that started earliest gets the most trimmed from its head; the one that started latest gets trimmed least. After trimming, frame 0 in all cameras corresponds to the same physical moment.
+Each camera is started manually, so recording start times differ by several seconds. A single clap provides a sharp audio transient visible in all recordings. Cross-correlation finds the precise sample offset between the reference camera's audio (`--ref-cam`, default cam 1) and every other camera. The camera that started earliest gets the most trimmed from its head; the one that started latest gets trimmed least. After trimming, frame 0 in all cameras corresponds to the same physical moment.
 
 Key detail: `scipy.signal.correlate(ref, other)` returns a positive lag when `other` started **after** `ref`. The trim formula is `trim[cam] = max_offset - offset[cam]` — the camera with the largest offset started earliest and needs the most cut.
 
@@ -129,8 +130,8 @@ Key detail: `scipy.signal.correlate(ref, other)` returns a positive lag when `ot
 Record a session where a checkerboard is clearly visible from all cameras, then sync it first:
 
 ```bash
-python sync_pipeline.py --base . --cams 5
-python run_calibration.py --board 9x12 --square-size 0.03 --base . --session session_01 --cams 5
+uv run python sync_pipeline.py --base . --cams 12
+uv run python run_calibration.py --board 9x12 --square-size 0.03 --base . --session session_01 --cams 12 --ref-cam 3
 ```
 
 | Flag | Default | Description |
@@ -139,7 +140,8 @@ python run_calibration.py --board 9x12 --square-size 0.03 --base . --session ses
 | `--square-size` | *required* | Checkerboard square side in metres (e.g. `0.03` for 30 mm) |
 | `--base` | `.` | Project root |
 | `--session` | `session_01` | Which synced session to calibrate from |
-| `--cams` | `5` | Number of cameras |
+| `--cams` | `12` | Number of cameras |
+| `--ref-cam` | `1` | Reference camera (its frame is the world origin; all extrinsics are expressed in it) |
 | `--every` | `30` | Process every Nth frame (30 = ~4fps at 120fps, 1 = all) |
 | `--max-frames` | `60` | Stop after this many frames where ALL cameras detected the board (0 = no limit) |
 
@@ -162,14 +164,14 @@ Detected frames go through `cv2.calibrateCamera()`. The output per camera is a m
 
 ### Phase 2: Extrinsic (Stereo) Calibration
 
-Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both Camera 1 and camera N detected the board at the same source frame number. Because Phase 1 processes all cameras in lockstep on the same frame numbers, shared frames are guaranteed to be truly time-synced (same physical moment, board in same pose). With `--max-frames 60`, at least 60 such shared frames are guaranteed for every camera pair.
+Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both the reference camera (`--ref-cam`) and camera N detected the board at the same source frame number. Because Phase 1 processes all cameras in lockstep on the same frame numbers, shared frames are guaranteed to be truly time-synced (same physical moment, board in same pose). With `--max-frames 60`, at least 60 such shared frames are guaranteed for every camera pair.
 
-For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The raw stereoCalibrate output is inverted so that R and T express **camN's pose in cam1's coordinate frame** (cam1 = origin). The output per pair:
+For each pair (ref-cam, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The raw stereoCalibrate output is inverted so that R and T express **camN's pose in the reference camera's coordinate frame** (ref-cam = origin). The output per pair:
 
 ```json
 {
-  "reference": "cam1",
-  "target": "cam2",
+  "reference": "cam3",
+  "target": "cam5",
   "R": [[...], [...], [...]],
   "T": [tx, ty, tz],
   "E": [[...], [...], [...]],
@@ -181,7 +183,7 @@ For each pair (cam1, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INT
 }
 ```
 
-`R` is the 3x3 rotation of camN relative to cam1. `T` is camN's optical center position in cam1's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from cam1's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only.
+`R` is the 3x3 rotation of camN relative to the reference. `T` is camN's optical center position in the reference's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from the reference's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only.
 
 The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters.
 

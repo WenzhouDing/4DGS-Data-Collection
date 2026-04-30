@@ -26,7 +26,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Epipolar geometry validation")
     p.add_argument("--base", default=".", help="Project root")
     p.add_argument("--session", default="session_01", help="Synced session")
-    p.add_argument("--cams", type=int, default=5, help="Number of cameras")
+    p.add_argument("--cams", type=int, default=12, help="Number of cameras")
+    p.add_argument("--ref-cam", type=int, default=1,
+                   help="Reference camera (must match the value used at calibration time)")
     p.add_argument("--board", default="9x12",
                    help="Board size as COLSxROWS in squares")
     p.add_argument("--num-frames", type=int, default=10,
@@ -51,8 +53,8 @@ def load_calib(calib_dir, num_cams):
         if os.path.exists(ext_path):
             with open(ext_path) as f:
                 ext = json.load(f)
-            # Saved R, T are camN's pose in cam1's frame.
-            # Invert to get cam1→camN transform for computing F.
+            # Saved R, T are camN's pose in the reference camera's frame.
+            # Invert to get ref→camN transform for computing F.
             R_saved = np.array(ext["R"])
             T_saved = np.array(ext["T"]).reshape(3, 1)
             R_orig = R_saved.T
@@ -65,7 +67,7 @@ def load_calib(calib_dir, num_cams):
 
 def compute_F(K1, K2, R, T):
     """Compute fundamental matrix from intrinsics and extrinsics.
-    R, T: cam1→cam2 transform (OpenCV convention).
+    R, T: ref→target transform (OpenCV convention).
     """
     Tx = np.array([
         [0, -T[2, 0], T[1, 0]],
@@ -162,7 +164,12 @@ def main():
     BASE = os.path.abspath(args.base)
     SESSION = args.session
     NUM_CAMS = args.cams
+    REF_CAM = args.ref_cam
     NUM_FRAMES = args.num_frames
+
+    if not (1 <= REF_CAM <= NUM_CAMS):
+        print(f"ERROR: --ref-cam {REF_CAM} must be in 1..{NUM_CAMS}")
+        raise SystemExit(1)
 
     parts = args.board.lower().split("x")
     if len(parts) != 2:
@@ -185,6 +192,7 @@ def main():
     print("=" * 70)
     print(f"  Session:     {SESSION}")
     print(f"  Cameras:     {NUM_CAMS}")
+    print(f"  Reference:   cam{REF_CAM}")
     print(f"  Board:       {board_cols}x{board_rows} -> "
           f"{BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners")
     print(f"  Frames:      {NUM_FRAMES}")
@@ -193,7 +201,7 @@ def main():
     cams = load_calib(CALIB_DIR, NUM_CAMS)
     print(f"  Loaded:      {len(cams)} cameras")
 
-    ref_cam = 1
+    ref_cam = REF_CAM
     if ref_cam not in cams:
         print(f"\nERROR: cam{ref_cam} calibration not found in {CALIB_DIR}.")
         print(f"  Expected: cam{ref_cam}_intrinsics.json")
@@ -229,9 +237,11 @@ def main():
     print(f"  Sampling:    {len(sample_indices)} frames")
     print()
 
-    # Evaluate each pair
+    # Evaluate each pair (ref vs every other camera)
     pair_results = {}
-    for cam in range(2, NUM_CAMS + 1):
+    for cam in range(1, NUM_CAMS + 1):
+        if cam == ref_cam:
+            continue
         if cam not in cams or "R_orig" not in cams[cam]:
             continue
 
@@ -292,7 +302,7 @@ def main():
             if frame_max > REJECT_THRESH:
                 frames_rejected += 1
                 sys.stdout.write(
-                    f"\r  Pair 1-{cam}: frame {target_frame} REJECTED "
+                    f"\r  Pair {ref_cam}-{cam}: frame {target_frame} REJECTED "
                     f"(max err {frame_max:.1f}px)          \n")
                 sys.stdout.flush()
                 continue
@@ -312,15 +322,15 @@ def main():
                 v1 = cv2.resize(v1, None, fx=scale, fy=scale)
                 v2 = cv2.resize(v2, None, fx=scale, fy=scale)
 
-                tag = f"pair_1_{cam}_f{target_frame}"
-                cv2.imwrite(os.path.join(OUT_DIR, f"{tag}_cam1.jpg"),
+                tag = f"pair_{ref_cam}_{cam}_f{target_frame}"
+                cv2.imwrite(os.path.join(OUT_DIR, f"{tag}_cam{ref_cam}.jpg"),
                             v1, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 cv2.imwrite(os.path.join(OUT_DIR, f"{tag}_cam{cam}.jpg"),
                             v2, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 vis_saved += 1
 
             sys.stdout.write(
-                f"\r  Pair 1-{cam}: {frames_evaluated} good, "
+                f"\r  Pair {ref_cam}-{cam}: {frames_evaluated} good, "
                 f"{frames_rejected} rejected / "
                 f"{fi+1} checked")
             sys.stdout.flush()
@@ -336,15 +346,15 @@ def main():
                 "frames_rejected": frames_rejected,
                 "total_point_pairs": len(all_dists) // 2,
             }
-            pair_results[f"1-{cam}"] = stats
-            print(f"\r  Pair 1-{cam}: mean={stats['mean_px']:.3f}px  "
+            pair_results[f"{ref_cam}-{cam}"] = stats
+            print(f"\r  Pair {ref_cam}-{cam}: mean={stats['mean_px']:.3f}px  "
                   f"median={stats['median_px']:.3f}px  "
                   f"p95={stats['p95_px']:.3f}px  "
                   f"max={stats['max_px']:.3f}px  "
                   f"({frames_evaluated} good, {frames_rejected} rejected)"
                   f"          ")
         else:
-            print(f"\r  Pair 1-{cam}: no valid frames found "
+            print(f"\r  Pair {ref_cam}-{cam}: no valid frames found "
                   f"({frames_rejected} rejected)")
 
     # Release captures

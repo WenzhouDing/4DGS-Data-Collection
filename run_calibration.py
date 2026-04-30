@@ -15,7 +15,7 @@ Only frames with detected corners are saved to disk (for validation).
 Outputs:
   output/calibration/
     cam{N}_intrinsics.json       — K, dist, image_size, rms
-    cam{N}_extrinsics.json       — R, T, E, F, stereo_rms (vs cam1)
+    cam{N}_extrinsics.json       — R, T, E, F, stereo_rms (vs --ref-cam)
     calibration_all_cameras.json — combined intrinsics + extrinsics
     checkerboard_config.json
     frame_extraction_log.json    — source frame numbers per camera
@@ -52,8 +52,11 @@ def parse_args():
                    help="Project root (contains output/ folder)")
     p.add_argument("--session", default="session_01",
                    help="Session to calibrate from")
-    p.add_argument("--cams", type=int, default=5,
+    p.add_argument("--cams", type=int, default=12,
                    help="Number of cameras")
+    p.add_argument("--ref-cam", type=int, default=1,
+                   help="Reference camera (its frame is the world origin; "
+                        "all extrinsics are expressed in it)")
     p.add_argument("--board", required=True,
                    help="Board size as COLSxROWS in squares, e.g. '9x12'")
     p.add_argument("--square-size", type=float, required=True,
@@ -224,9 +227,14 @@ def main():
     BASE = os.path.abspath(args.base)
     SESSION = args.session
     NUM_CAMS = args.cams
+    REF_CAM = args.ref_cam
     SQUARE_SIZE_M = args.square_size
     EVERY_N = args.every
     MAX_FRAMES = args.max_frames
+
+    if not (1 <= REF_CAM <= NUM_CAMS):
+        print(f"ERROR: --ref-cam {REF_CAM} must be in 1..{NUM_CAMS}")
+        raise SystemExit(1)
 
     # Parse board size: "9x12" squares -> (8, 11) inner corners
     parts = args.board.lower().split("x")
@@ -254,6 +262,7 @@ def main():
     print("=" * 70)
     print(f"  Session:       {SESSION}")
     print(f"  Cameras:       {NUM_CAMS}")
+    print(f"  Reference cam: {REF_CAM} (extrinsics expressed in cam{REF_CAM} frame)")
     print(f"  Board:         {board_cols}x{board_rows} squares "
           f"-> {BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners")
     print(f"  Square size:   {SQUARE_SIZE_M*1000:.1f} mm")
@@ -535,11 +544,11 @@ def main():
         # ══════════════════════════════════════════════════════════
         # STEP 3: EXTRINSIC (STEREO) CALIBRATION
         # ══════════════════════════════════════════════════════════
-        step_header(3, "Extrinsic calibration (each cam vs Cam 1)")
+        step_header(3, f"Extrinsic calibration (each cam vs Cam {REF_CAM})")
 
-        ref_cam = 1
+        ref_cam = REF_CAM
         if intrinsics[ref_cam] is None:
-            print("  ERROR: Cam 1 intrinsic calibration failed!")
+            print(f"  ERROR: Cam {ref_cam} intrinsic calibration failed!")
             raise SystemExit(1)
 
         K1 = intrinsics[ref_cam]["K"]
@@ -547,9 +556,11 @@ def main():
         extrinsics = {}
         stereo_rms_map = {}
 
-        for cam in range(2, NUM_CAMS + 1):
+        for cam in range(1, NUM_CAMS + 1):
+            if cam == ref_cam:
+                continue
             if intrinsics[cam] is None:
-                print(f"  Pair 1-{cam}: SKIP — cam {cam} intrinsics failed")
+                print(f"  Pair {ref_cam}-{cam}: SKIP — cam {cam} intrinsics failed")
                 continue
 
             K2 = intrinsics[cam]["K"]
@@ -562,12 +573,12 @@ def main():
             shared = sorted(ref_names & other_names)
 
             if len(shared) < 8:
-                print(f"  Pair 1-{cam}: SKIP — "
+                print(f"  Pair {ref_cam}-{cam}: SKIP — "
                       f"{len(shared)} shared frames (need >= 8)")
                 continue
 
             progress(
-                f"  Pair 1-{cam}: calibrating ({len(shared)} shared)...",
+                f"  Pair {ref_cam}-{cam}: calibrating ({len(shared)} shared)...",
                 end="")
 
             obj_pts_shared = [objp] * len(shared)
@@ -589,13 +600,13 @@ def main():
                     flags=flags,
                 )
             except cv2.error as e:
-                print(f"\r  Pair 1-{cam}: FAILED — stereoCalibrate "
+                print(f"\r  Pair {ref_cam}-{cam}: FAILED — stereoCalibrate "
                       f"raised: {e}                                   ")
                 continue
 
-            # Invert to get camN's pose in cam1's frame
-            # stereoCalibrate gives P_camN = R * P_cam1 + T
-            # We want camN in cam1: R_inv = R^T, T_inv = -R^T * T
+            # Invert to get camN's pose in the reference camera's frame.
+            # stereoCalibrate gives P_camN = R * P_ref + T
+            # We want camN in ref: R_inv = R^T, T_inv = -R^T * T
             R_inv = R.T
             T_inv = -R.T @ T
 
@@ -610,16 +621,16 @@ def main():
                 ey = np.arctan2(-R_inv[2, 0], sy)
                 ez = 0
 
-            stereo_rms_map[f"1-{cam}"] = ret
+            stereo_rms_map[f"{ref_cam}-{cam}"] = ret
 
             progress(
-                f"\r  Pair 1-{cam}: RMS={ret:.4f}px  "
+                f"\r  Pair {ref_cam}-{cam}: RMS={ret:.4f}px  "
                 f"baseline={baseline_m*100:.2f}cm  "
                 f"T=[{T_inv[0,0]:.4f}, {T_inv[1,0]:.4f}, {T_inv[2,0]:.4f}]m  "
                 f"({len(shared)} shared)          ")
 
             ext_data = {
-                "reference": "cam1",
+                "reference": f"cam{ref_cam}",
                 "target": f"cam{cam}",
                 "R": R_inv.tolist(),
                 "T": T_inv.flatten().tolist(),
@@ -661,16 +672,16 @@ def main():
 
                 base = fn.replace(".jpg", "")
                 p1 = os.path.join(STEREO_VAL,
-                                  f"pair_1_{cam}_{base}_cam1.jpg")
+                                  f"pair_{ref_cam}_{cam}_{base}_cam{ref_cam}.jpg")
                 p2 = os.path.join(STEREO_VAL,
-                                  f"pair_1_{cam}_{base}_cam{cam}.jpg")
+                                  f"pair_{ref_cam}_{cam}_{base}_cam{cam}.jpg")
                 cv2.imwrite(p1, vis1, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 cv2.imwrite(p2, vis2, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
         if stereo_rms_map:
             make_bar_chart(
                 list(stereo_rms_map.values()),
-                [f"Cam 1-{k.split('-')[1]}" for k in stereo_rms_map.keys()],
+                [f"Cam {k}" for k in stereo_rms_map.keys()],
                 "Stereo Calibration RMS — All Pairs",
                 "Stereo RMS (px)",
                 os.path.join(STEREO_VAL, "stereo_rms.png"),
@@ -696,7 +707,7 @@ def main():
 
             if cam in extrinsics:
                 entry["extrinsics"] = {
-                    "reference": "cam1",
+                    "reference": f"cam{REF_CAM}",
                     "R": extrinsics[cam]["R"],
                     "T": extrinsics[cam]["T"],
                     "stereo_rms_px": extrinsics[cam]["stereo_rms_px"],
@@ -763,15 +774,17 @@ def main():
                 print(f"    Cam {cam}: RMS={intrinsics[cam]['rms']:.4f}px  "
                       f"fx={K[0,0]:.1f} fy={K[1,1]:.1f}  ({n} frames)")
 
-        print(f"\n  Extrinsics (vs Cam 1):")
-        for cam in range(2, NUM_CAMS + 1):
+        print(f"\n  Extrinsics (vs Cam {REF_CAM}):")
+        for cam in range(1, NUM_CAMS + 1):
+            if cam == REF_CAM:
+                continue
             if cam in extrinsics:
                 e = extrinsics[cam]
-                print(f"    Pair 1-{cam}: RMS={e['stereo_rms_px']:.4f}px  "
+                print(f"    Pair {REF_CAM}-{cam}: RMS={e['stereo_rms_px']:.4f}px  "
                       f"baseline={e['baseline_m']*100:.2f}cm  "
                       f"({e['shared_frames']} shared)")
             else:
-                print(f"    Pair 1-{cam}: FAILED")
+                print(f"    Pair {REF_CAM}-{cam}: FAILED")
 
         print(f"\n  Output: {OUTPUT}/")
         print("  Done!")

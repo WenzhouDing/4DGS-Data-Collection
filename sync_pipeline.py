@@ -31,7 +31,9 @@ from datetime import datetime
 def parse_args():
     p = argparse.ArgumentParser(description="Multi-camera GoPro audio sync pipeline")
     p.add_argument("--base", default=".", help="Base directory containing camera folders 1/ 2/ ... N/")
-    p.add_argument("--cams", type=int, default=5, help="Number of cameras")
+    p.add_argument("--cams", type=int, default=12, help="Number of cameras")
+    p.add_argument("--ref-cam", type=int, default=1,
+                   help="Reference camera (cross-correlation reference + preview audio source)")
     p.add_argument("--search-window", type=int, default=15, help="Seconds of audio to search for clap")
     p.add_argument("--preview-height", type=int, default=360, help="Preview per-camera height in px")
     p.add_argument("--preview-max-sec", type=int, default=30, help="Max preview duration in seconds")
@@ -161,9 +163,14 @@ def main():
     OUTPUT_BASE = os.path.join(VIDEO_BASE, "output")
     WORK_DIR = os.path.join(VIDEO_BASE, ".sync_work")
     NUM_CAMS = args.cams
+    REF_CAM = args.ref_cam
     SEARCH_WINDOW_SEC = args.search_window
     PREVIEW_HEIGHT = args.preview_height
     PREVIEW_MAX_SEC = args.preview_max_sec
+
+    if not (1 <= REF_CAM <= NUM_CAMS):
+        print(f"ERROR: --ref-cam {REF_CAM} must be in 1..{NUM_CAMS}")
+        raise SystemExit(1)
 
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(OUTPUT_BASE, exist_ok=True)
@@ -254,12 +261,14 @@ def main():
             print(f"    Cam {cam}: {len(data)} samples ({len(data) / rate:.2f}s)")
 
         # Cross-correlation sync
-        print("\n  Cross-correlating (Cam 1 = reference)...")
-        ref_cam = 1
+        print(f"\n  Cross-correlating (Cam {REF_CAM} = reference)...")
+        ref_cam = REF_CAM
         search_samples = int(SAMPLE_RATE * SEARCH_WINDOW_SEC)
         offsets = {ref_cam: (0, 1.0)}
 
-        for cam in range(2, NUM_CAMS + 1):
+        for cam in range(1, NUM_CAMS + 1):
+            if cam == ref_cam:
+                continue
             lag, conf = cross_correlate_offset(
                 audio_data[ref_cam], audio_data[cam], search_samples
             )
@@ -330,19 +339,50 @@ def main():
                       f"trim=duration={cap},setpts=PTS-STARTPTS,")
             filter_str += f"[{idx}:v]{trim_f}scale=-2:{PREVIEW_HEIGHT}[v{cam}];\n"
 
-        filter_str += "[v1][v2][v3]hstack=inputs=3[top];\n"
-        filter_str += "[v4][v5]hstack=inputs=2[bot_raw];\n"
-        filter_str += "[bot_raw]pad=iw*3/2:ih:0:0:black[bot];\n"
-        filter_str += "[top][bot]vstack=inputs=2[out];\n"
+        # N-camera grid: cols = ceil(sqrt(N)), rows = ceil(N/cols).
+        # Lay out with hstack per row, then vstack the rows. The last row
+        # is padded with black so its width matches the full-width rows.
+        import math
+        grid_cols = math.ceil(math.sqrt(NUM_CAMS))
+        grid_rows = math.ceil(NUM_CAMS / grid_cols)
+        row_labels = []
+        cam_iter = iter(range(1, NUM_CAMS + 1))
+        for r in range(grid_rows):
+            row_cams = []
+            for _ in range(grid_cols):
+                c = next(cam_iter, None)
+                if c is None:
+                    break
+                row_cams.append(c)
+            label = f"row{r}"
+            if len(row_cams) == 1:
+                # hstack=inputs=1 is invalid; pass through with a copy
+                filter_str += f"[v{row_cams[0]}]copy[{label}_raw];\n"
+            else:
+                filter_str += "".join(f"[v{c}]" for c in row_cams)
+                filter_str += f"hstack=inputs={len(row_cams)}[{label}_raw];\n"
+            if len(row_cams) < grid_cols:
+                # pad short last row to full width so vstack works
+                filter_str += (f"[{label}_raw]pad=iw*{grid_cols}/{len(row_cams)}"
+                               f":ih:0:0:black[{label}];\n")
+            else:
+                filter_str += f"[{label}_raw]copy[{label}];\n"
+            row_labels.append(label)
+        if len(row_labels) == 1:
+            filter_str += f"[{row_labels[0]}]copy[out];\n"
+        else:
+            filter_str += "".join(f"[{lbl}]" for lbl in row_labels)
+            filter_str += f"vstack=inputs={len(row_labels)}[out];\n"
 
-        # Audio from cam1 (reference), trimmed to match the synced video
-        a_ss = trim_sec[1]
+        # Audio from the reference camera, trimmed to match the synced video
+        a_ss = trim_sec[REF_CAM]
         a_dur = min(common_dur, PREVIEW_MAX_SEC)
+        ref_audio_idx = REF_CAM - 1  # ffmpeg input index (preview_inputs is 0-indexed)
         if a_ss > 0.0001:
-            filter_str += (f"[0:a]atrim=start={a_ss:.6f}:duration={a_dur},"
+            filter_str += (f"[{ref_audio_idx}:a]atrim=start={a_ss:.6f}:duration={a_dur},"
                            f"asetpts=PTS-STARTPTS[aout]")
         else:
-            filter_str += f"[0:a]atrim=duration={a_dur},asetpts=PTS-STARTPTS[aout]"
+            filter_str += f"[{ref_audio_idx}:a]atrim=duration={a_dur},asetpts=PTS-STARTPTS[aout]"
 
         preview_path = os.path.join(session_out, f"{session_name}_preview.mp4")
         cmd = ["ffmpeg", "-y", "-v", "quiet"]
@@ -362,11 +402,11 @@ def main():
                 prev_size = os.path.getsize(preview_path) / (1024 * 1024)
                 print(f"    -> {os.path.basename(preview_path)} ({prev_size:.1f} MB)")
             else:
-                print(f"    WARNING: preview failed, falling back to cam1 only")
-                fallback = session_files[1].get("lrv_path") or session_files[1]["path"]
+                print(f"    WARNING: preview failed, falling back to cam{REF_CAM} only")
+                fallback = session_files[REF_CAM].get("lrv_path") or session_files[REF_CAM]["path"]
                 subprocess.run([
                     "ffmpeg", "-y", "-v", "quiet",
-                    "-ss", f"{trim_sec[1]:.6f}", "-i", fallback,
+                    "-ss", f"{trim_sec[REF_CAM]:.6f}", "-i", fallback,
                     "-t", str(min(common_dur, PREVIEW_MAX_SEC)),
                     "-vf", f"scale=-2:{PREVIEW_HEIGHT}",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "28",
@@ -452,10 +492,11 @@ def main():
             report.append(f"| Cam {cam} | {p['time_sec']:.4f}s | {p['sample']} | {p['amplitude']:.4f} |")
 
         report.append("\n## Sanity Checks")
-        confidences = [offsets[cam][1] for cam in range(2, NUM_CAMS + 1)]
+        non_ref = [c for c in range(1, NUM_CAMS + 1) if c != REF_CAM]
+        confidences = [offsets[cam][1] for cam in non_ref]
         min_conf = min(confidences)
         max_offset_ms = max(abs(offsets[cam][0]) / SAMPLE_RATE * 1000
-                            for cam in range(2, NUM_CAMS + 1))
+                            for cam in non_ref)
         dur_spread = max(session_files[c]["duration"] for c in range(1, NUM_CAMS + 1)) - \
                      min(session_files[c]["duration"] for c in range(1, NUM_CAMS + 1))
         checks = [

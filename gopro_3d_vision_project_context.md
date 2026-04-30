@@ -218,7 +218,7 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 - `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, N-camera preview grid, chapter merging by `creation_time`)
 - `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping, configurable `--ref-cam`)
 - `run_eval_epipolar.py` — Standalone epipolar-geometry validation (loads calibration JSONs, samples frames, measures point-to-line epipolar distance with outlier rejection)
-- `sync_vis.py` — Interactive matplotlib visualizer for ±2 frame per-camera offset adjustments after auto-sync; writes `output/<session>/sync_adjustments.json`
+- `sync_vis.py` — Local Flask web server + HTML5 `<video>` grid for ±2 frame per-camera offset adjustments after auto-sync; writes `output/<session>/sync_adjustments.json`. Uses macOS hardware HEVC decode + GPU compositing for smooth scrubbing.
 - `pyproject.toml` + `uv.lock` — uv project metadata and locked dependencies (numpy, scipy, opencv-python, matplotlib); install with `uv sync`
 - `gopro_hero10_3d_rig_config.txt` — The full camera config with QR URLs, all params, per-camera naming URLs, time sync links, and operational notes
 - `gopro_3d_vision_project_context.md` — This file (full context dump for agent handoff)

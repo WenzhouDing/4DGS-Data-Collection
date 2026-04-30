@@ -250,11 +250,16 @@ File numbering differs across cameras — that's why pairing is done by recordin
 
 ## Sync Fine-Tune (`sync_vis.py`)
 
-After running `sync_pipeline.py`, audio-clap sync is usually accurate to within one frame, but residual sub-frame drift can leave a camera 1–2 frames off the visually-correct moment. `sync_vis.py` opens the synced videos in an interactive matplotlib window and lets you nudge each camera by ±2 frames:
+After running `sync_pipeline.py`, audio-clap sync is usually accurate to within one frame, but residual sub-frame drift can leave a camera 1–2 frames off the visually-correct moment. `sync_vis.py` runs a small **local web server** with a browser-based UI that lets you nudge each camera by ±2 frames using the macOS hardware HEVC decoder for fast, smooth scrubbing:
 
 ```bash
 uv run python sync_vis.py --base . --session session_01 --cams 12 --ref-cam 1
 ```
+
+A browser tab opens automatically (Ctrl+C to stop the server). Architecture:
+- **Flask** backend serves the synced MP4s with HTTP Range support — the browser only fetches what it needs.
+- **HTML5 `<video>` elements** in a CSS grid use the browser's hardware HEVC decoder. Setting `video.currentTime` is much faster than `cv2.VideoCapture` seeking, and the GPU compositor keeps the multi-camera grid smooth.
+- **Single-page UI** (no React, no build step) — just an embedded HTML/CSS/JS template in `sync_vis.py`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -262,12 +267,15 @@ uv run python sync_vis.py --base . --session session_01 --cams 12 --ref-cam 1
 | `--session` | `session_01` | Synced session to fine-tune |
 | `--cams` | `12` | Number of cameras |
 | `--ref-cam` | `1` | Reference camera (its offset stays at 0) |
-| `--start-frame` | `total/10` | Initial frame to display |
+| `--port` | `8765` | Local port for the web UI |
+| `--no-browser` | off | Skip auto-opening a browser tab |
 
 Controls:
-- **Frame slider** — scrubs across the synced timeline
-- **Per-camera offset slider** (`c1`, `c2`, …, `cN`) — shifts that camera by −2/−1/0/+1/+2 frames relative to the frame slider
-- **Save** — writes `output/<session>/sync_adjustments.json` with the chosen offsets. Re-running the tool resumes from the saved values.
+- **Frame slider** at the top — scrubs across the synced timeline
+- **Per-camera ±2 ticks** — click `−2 / −1 / 0 / +1 / +2` for each camera; only that camera reseeks
+- **Save adjustments** button — writes `output/<session>/sync_adjustments.json`. Re-launching resumes from the saved values.
+
+Keyboard shortcuts: <kbd>←</kbd>/<kbd>→</kbd> step ±1 frame · <kbd>shift</kbd>+arrow ±10 · <kbd>home</kbd>/<kbd>end</kbd> · <kbd>1</kbd>–<kbd>9</kbd> focus a cam's offset · <kbd>s</kbd> save.
 
 The tool **does not re-trim videos** — it only writes the JSON. Downstream tools that respect this file can apply the offsets when indexing into the synced videos.
 

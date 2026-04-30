@@ -1,53 +1,64 @@
 #!/usr/bin/env python3
 """
-Sync fine-tune visualizer
-=========================
-Interactively inspect synced multi-camera video and apply per-camera ±2
-frame offset adjustments. Useful when audio-clap sync hits the right second
-but a camera's internal clock means the visually-correct frame is 1-2
-frames off the auto-detected sync.
+Sync fine-tune visualizer — browser UI
+======================================
+Browser-based ±2 frame per-camera offset adjustment for synced GoPro video.
 
-Layout: an N-camera grid of frames (same wider-than-tall heuristic as the
-sync pipeline), one frame slider scrubbing across the synced timeline, and
-one ±2 offset slider per camera.  Saving writes only a small JSON; this
-tool never re-trims the videos.
+Architecture
+------------
+Flask backend + HTML5 <video> frontend.
+  * Browser uses hardware-accelerated HEVC decode and GPU compositing —
+    seeking and scrubbing across the camera grid is far smoother than the
+    cv2.VideoCapture + matplotlib approach.
+  * Backend is just Flask + send_file with HTTP Range support (Werkzeug
+    handles the Range header automatically when conditional=True).
+  * Frontend is a single embedded HTML page (no React, no build step) —
+    plain CSS Grid for layout, range inputs for sliders, keyboard
+    shortcuts for fast iteration.
 
-Outputs:
-  output/<session>/sync_adjustments.json  — { ref_cam, frame_offsets, ... }
+Endpoints
+---------
+GET  /            single-page UI
+GET  /metadata    JSON: cams, fps, total_frames, ref_cam, grid, offsets
+GET  /video/<N>   serves cam{N}_synced.mp4 (range-supported)
+POST /save        writes offsets to output/<session>/sync_adjustments.json
 
-Downstream tools that respect this file (TBD) can apply the offsets when
-indexing into the synced videos.
-
-Usage:
+Usage
+-----
     uv run python sync_vis.py [--base DIR] [--session SESSION]
-                              [--cams N] [--ref-cam N]
+                              [--cams N] [--ref-cam N] [--port PORT]
+
+The browser opens automatically. Ctrl+C to stop the server.
 """
 
 import argparse
 import json
 import math
 import os
+import threading
+import webbrowser
 
 import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button
+from flask import Flask, jsonify, request, send_file, Response
 
 
+# ─── CLI ──────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="Sync fine-tune visualizer")
+    p = argparse.ArgumentParser(description="Sync fine-tune visualizer (web UI)")
     p.add_argument("--base", default=".", help="Project root")
     p.add_argument("--session", default="session_01", help="Synced session")
     p.add_argument("--cams", type=int, default=12, help="Number of cameras")
     p.add_argument("--ref-cam", type=int, default=1,
                    help="Reference camera (its offset stays at 0)")
-    p.add_argument("--start-frame", type=int, default=None,
-                   help="Initial frame to display (default: 10%% of total)")
+    p.add_argument("--port", type=int, default=8765,
+                   help="Local port for the web UI")
+    p.add_argument("--no-browser", action="store_true",
+                   help="Don't auto-open a browser tab")
     return p.parse_args()
 
 
 def grid_layout(n):
-    """Wider-than-tall grid heuristic (matches sync_pipeline preview)."""
+    """Wider-than-tall heuristic, matches the sync preview grid."""
     if n <= 3:
         return n, 1
     cols = math.ceil(n / 2)
@@ -55,16 +66,438 @@ def grid_layout(n):
     return cols, rows
 
 
-def read_frame(cap, frame_idx, total_frames):
-    """Seek and decode the frame at frame_idx (clamped). Returns RGB or None."""
-    fi = max(0, min(total_frames - 1, int(frame_idx)))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-    ret, bgr = cap.read()
-    if not ret:
-        return None
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+# ─── Embedded frontend ────────────────────────────────────────────
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sync Visualizer</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #7d8590;
+    --accent: #2ea043;
+    --accent-hover: #3fb950;
+    --ref: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    background: var(--bg); color: var(--text);
+    font-size: 13px;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 500; letter-spacing: 0.2px; }
+  h1 .session { color: var(--muted); }
+  button {
+    background: var(--accent); color: #fff; border: 0;
+    padding: 7px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 500;
+    transition: background 0.15s;
+  }
+  button:hover { background: var(--accent-hover); }
+  button:active { transform: scale(0.98); }
+  .help-text { color: var(--muted); font-size: 11px; }
+  .frame-bar {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 12px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .frame-bar label { font-weight: 500; min-width: 50px; }
+  .frame-bar input[type=range] {
+    flex: 1; height: 6px; accent-color: var(--accent);
+  }
+  .frame-bar .display {
+    font-family: "SF Mono", Menlo, monospace; min-width: 200px;
+    text-align: right; color: var(--muted);
+  }
+  .video-grid {
+    display: grid; gap: 6px; margin-bottom: 14px;
+  }
+  .video-cell {
+    position: relative; background: #000;
+    border: 2px solid var(--border); border-radius: 4px;
+    overflow: hidden; aspect-ratio: 16 / 9;
+  }
+  .video-cell.ref { border-color: var(--ref); }
+  .video-cell video {
+    width: 100%; height: 100%; object-fit: contain; display: block;
+  }
+  .video-cell .badge {
+    position: absolute; top: 4px; left: 4px;
+    background: rgba(0, 0, 0, 0.78); padding: 3px 7px;
+    border-radius: 3px; font-size: 11px;
+    font-family: "SF Mono", Menlo, monospace;
+    pointer-events: none;
+  }
+  .video-cell.ref .badge { color: var(--ref); }
+  .video-cell .offset-tag {
+    position: absolute; top: 4px; right: 4px;
+    background: rgba(0, 0, 0, 0.78); padding: 3px 7px;
+    border-radius: 3px; font-size: 11px;
+    font-family: "SF Mono", Menlo, monospace;
+    pointer-events: none;
+  }
+  .offsets {
+    display: grid; gap: 8px; padding: 12px;
+    background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .offset-row {
+    display: flex; align-items: center; gap: 12px;
+  }
+  .offset-row .name {
+    font-family: "SF Mono", Menlo, monospace;
+    min-width: 60px; font-weight: 500;
+  }
+  .offset-row.ref .name { color: var(--ref); }
+  .offset-row .ticks {
+    display: flex; gap: 4px;
+  }
+  .offset-row .tick {
+    width: 32px; height: 28px;
+    background: #21262d; border: 1px solid var(--border);
+    color: var(--text); border-radius: 4px; cursor: pointer;
+    font-family: "SF Mono", Menlo, monospace; font-size: 12px;
+    transition: all 0.1s;
+  }
+  .offset-row .tick:hover { background: #30363d; }
+  .offset-row .tick.active {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+  }
+  .offset-row.ref .tick.active {
+    background: var(--ref); border-color: var(--ref);
+  }
+  .offset-row .value {
+    font-family: "SF Mono", Menlo, monospace;
+    color: var(--muted); min-width: 30px;
+  }
+  .status {
+    margin-top: 10px; padding: 8px 12px; min-height: 20px;
+    color: var(--muted); font-family: "SF Mono", Menlo, monospace;
+    font-size: 12px; text-align: right;
+  }
+  .status.ok { color: var(--accent); }
+  .shortcuts {
+    margin-top: 12px; padding: 10px 14px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted); font-size: 11px;
+    display: flex; gap: 18px; flex-wrap: wrap;
+  }
+  kbd {
+    background: #21262d; border: 1px solid var(--border);
+    border-radius: 3px; padding: 1px 6px;
+    font-family: "SF Mono", Menlo, monospace; font-size: 11px;
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sync Visualizer — <span class="session" id="session-name">…</span></h1>
+  <button id="save-btn">Save adjustments</button>
+</header>
+
+<div class="frame-bar">
+  <label>Frame</label>
+  <input type="range" id="frame-slider" min="0" max="0" value="0" step="1">
+  <div class="display" id="frame-display">—</div>
+</div>
+
+<div class="video-grid" id="video-grid"></div>
+
+<div class="offsets" id="offsets"></div>
+
+<div class="shortcuts">
+  <span><kbd>←</kbd> <kbd>→</kbd> step ±1 frame</span>
+  <span><kbd>shift</kbd>+<kbd>←</kbd>/<kbd>→</kbd> step ±10</span>
+  <span><kbd>home</kbd>/<kbd>end</kbd> jump to start/end</span>
+  <span><kbd>1</kbd>–<kbd>9</kbd> focus cam offset</span>
+  <span><kbd>s</kbd> save</span>
+  <span>Hover a video to see <kbd>frame</kbd> + <kbd>offset</kbd></span>
+</div>
+
+<div class="status" id="status"></div>
+
+<script>
+"use strict";
+let META, FPS, TOTAL, REF, CAMS, GRID;
+const offsets = {};
+const videos = {};
+const offsetTagEls = {};
+const tickEls = {};
+let currentFrame = 0;
+
+const $ = (id) => document.getElementById(id);
+
+async function init() {
+  const r = await fetch("/metadata");
+  META = await r.json();
+  FPS = META.fps;
+  TOTAL = META.total_frames;
+  REF = META.ref_cam;
+  CAMS = META.cams;
+  GRID = META.grid;
+
+  CAMS.forEach(c => {
+    const k = `cam${c}`;
+    offsets[k] = (META.offsets && META.offsets[k] !== undefined)
+      ? META.offsets[k] : 0;
+  });
+
+  $("session-name").textContent = META.session;
+
+  // Video grid
+  const grid = $("video-grid");
+  grid.style.gridTemplateColumns = `repeat(${GRID.cols}, 1fr)`;
+  CAMS.forEach(c => {
+    const cell = document.createElement("div");
+    cell.className = "video-cell" + (c === REF ? " ref" : "");
+    const v = document.createElement("video");
+    v.muted = true; v.preload = "auto"; v.playsInline = true;
+    v.src = `/video/${c}`;
+    cell.appendChild(v);
+    const badge = document.createElement("div");
+    badge.className = "badge";
+    badge.textContent = `cam${c}${c === REF ? ' (ref)' : ''}`;
+    cell.appendChild(badge);
+    const tag = document.createElement("div");
+    tag.className = "offset-tag";
+    tag.id = `tag-${c}`;
+    cell.appendChild(tag);
+    grid.appendChild(cell);
+    videos[c] = v;
+    offsetTagEls[c] = tag;
+  });
+
+  // Offset rows
+  const offsetsEl = $("offsets");
+  CAMS.forEach(c => {
+    const row = document.createElement("div");
+    row.className = "offset-row" + (c === REF ? " ref" : "");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = `cam${c}${c === REF ? ' (ref)' : ''}`;
+    row.appendChild(name);
+    const ticks = document.createElement("div");
+    ticks.className = "ticks";
+    tickEls[c] = {};
+    [-2, -1, 0, 1, 2].forEach(v => {
+      const btn = document.createElement("button");
+      btn.className = "tick";
+      btn.textContent = v >= 0 ? `+${v}` : `${v}`;
+      btn.addEventListener("click", () => setOffset(c, v));
+      tickEls[c][v] = btn;
+      ticks.appendChild(btn);
+    });
+    row.appendChild(ticks);
+    const valEl = document.createElement("span");
+    valEl.className = "value";
+    valEl.id = `val-${c}`;
+    row.appendChild(valEl);
+    offsetsEl.appendChild(row);
+    refreshTicks(c);
+  });
+
+  // Frame slider
+  const fs = $("frame-slider");
+  fs.max = TOTAL - 1;
+  fs.addEventListener("input", e => {
+    currentFrame = parseInt(e.target.value);
+    seekAll();
+    updateFrameDisplay();
+  });
+
+  // Save
+  $("save-btn").addEventListener("click", save);
+
+  // Keyboard shortcuts
+  document.addEventListener("keydown", onKey);
+
+  // Wait for all videos to have loadedmetadata, then initial seek.
+  await Promise.all(CAMS.map(c => new Promise(res => {
+    if (videos[c].readyState >= 1) res();
+    else videos[c].addEventListener("loadedmetadata", () => res(), { once: true });
+  })));
+
+  currentFrame = Math.floor(TOTAL * 0.1);
+  fs.value = currentFrame;
+  seekAll();
+  updateFrameDisplay();
+  setStatus(`Loaded ${CAMS.length} cameras · ${TOTAL} frames @ ${FPS.toFixed(2)} fps · ref=cam${REF}`);
+}
+
+function setOffset(c, v) {
+  offsets[`cam${c}`] = v;
+  refreshTicks(c);
+  $(`val-${c}`).textContent = v >= 0 ? `+${v}` : `${v}`;
+  seekCam(c);
+}
+
+function refreshTicks(c) {
+  const cur = offsets[`cam${c}`];
+  [-2, -1, 0, 1, 2].forEach(v => {
+    tickEls[c][v].classList.toggle("active", v === cur);
+  });
+  $(`val-${c}`).textContent = cur >= 0 ? `+${cur}` : `${cur}`;
+}
+
+function seekAll() {
+  CAMS.forEach(seekCam);
+}
+
+function seekCam(c) {
+  const o = offsets[`cam${c}`];
+  let target = currentFrame + o;
+  if (target < 0) target = 0;
+  if (target > TOTAL - 1) target = TOTAL - 1;
+  // Seek to mid-frame timestamp to avoid landing on a boundary.
+  videos[c].currentTime = (target + 0.5) / FPS;
+  offsetTagEls[c].textContent = `f=${target} ${o >= 0 ? '+' : ''}${o}`;
+}
+
+function updateFrameDisplay() {
+  $("frame-display").textContent =
+    `${currentFrame} / ${TOTAL - 1}  ·  ${(currentFrame / FPS).toFixed(3)}s`;
+}
+
+function onKey(e) {
+  // Don't hijack if user is typing in an input.
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  let handled = true;
+  const step = e.shiftKey ? 10 : 1;
+  if (e.key === "ArrowRight") {
+    currentFrame = Math.min(TOTAL - 1, currentFrame + step);
+  } else if (e.key === "ArrowLeft") {
+    currentFrame = Math.max(0, currentFrame - step);
+  } else if (e.key === "Home") {
+    currentFrame = 0;
+  } else if (e.key === "End") {
+    currentFrame = TOTAL - 1;
+  } else if (e.key === "s" || e.key === "S") {
+    save();
+    return;
+  } else if (/^[1-9]$/.test(e.key)) {
+    const c = parseInt(e.key);
+    if (CAMS.includes(c)) {
+      const el = tickEls[c][offsets[`cam${c}`]];
+      if (el) { el.scrollIntoView({behavior: "smooth", block: "nearest"}); el.focus(); }
+    }
+    handled = false;
+  } else {
+    handled = false;
+  }
+  if (handled) {
+    $("frame-slider").value = currentFrame;
+    seekAll();
+    updateFrameDisplay();
+    e.preventDefault();
+  }
+}
+
+async function save() {
+  setStatus("Saving…");
+  try {
+    const r = await fetch("/save", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({frame_offsets: offsets}),
+    });
+    const data = await r.json();
+    if (data.status === "ok") {
+      const summary = CAMS.map(c => `cam${c}=${fmt(offsets[`cam${c}`])}`).join(" ");
+      setStatus(`Saved ${new Date().toLocaleTimeString()} → ${data.path}  ·  ${summary}`, true);
+    } else {
+      setStatus(`Save failed: ${data.error || 'unknown'}`);
+    }
+  } catch (e) {
+    setStatus(`Save error: ${e.message}`);
+  }
+}
+
+function fmt(v) { return v >= 0 ? `+${v}` : `${v}`; }
+
+function setStatus(msg, ok) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = "status" + (ok ? " ok" : "");
+}
+
+init().catch(e => {
+  setStatus(`Init error: ${e.message}`);
+  console.error(e);
+});
+</script>
+</body>
+</html>
+"""
 
 
+# ─── Backend ──────────────────────────────────────────────────────
+app = Flask(__name__)
+VIDEO_PATHS = {}
+META = {}
+SAVE_PATH = ""
+
+
+@app.route("/")
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.route("/metadata")
+def metadata():
+    return jsonify(META)
+
+
+@app.route("/video/<int:cam>")
+def video(cam):
+    path = VIDEO_PATHS.get(cam)
+    if not path:
+        return ("not found", 404)
+    return send_file(path, mimetype="video/mp4", conditional=True)
+
+
+@app.route("/save", methods=["POST"])
+def save_offsets():
+    data = request.get_json(silent=True) or {}
+    incoming = data.get("frame_offsets", {})
+    cleaned = {}
+    for cam in META["cams"]:
+        key = f"cam{cam}"
+        try:
+            v = int(incoming.get(key, 0))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "error": f"non-int offset for {key}"}), 400
+        if v < -2 or v > 2:
+            return jsonify({"status": "error", "error": f"{key} out of range"}), 400
+        cleaned[key] = v
+    out = {
+        "session": META["session"],
+        "ref_cam": META["ref_cam"],
+        "fps": META["fps"],
+        "total_frames": META["total_frames"],
+        "frame_offsets": cleaned,
+    }
+    os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+    with open(SAVE_PATH, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"  Saved offsets -> {SAVE_PATH}: {cleaned}")
+    return jsonify({"status": "ok", "path": SAVE_PATH})
+
+
+# ─── Main ─────────────────────────────────────────────────────────
 def main():
     args = parse_args()
     BASE = os.path.abspath(args.base)
@@ -77,10 +510,12 @@ def main():
         raise SystemExit(1)
 
     SYNCED_DIR = os.path.join(BASE, "output", SESSION, "synced_raw")
-    SAVE_PATH = os.path.join(BASE, "output", SESSION, "sync_adjustments.json")
+    save_path = os.path.join(BASE, "output", SESSION, "sync_adjustments.json")
 
-    # Open captures
-    caps = {}
+    # Probe every available synced video for fps + frame count via cv2.
+    fps = None
+    total_frames = None
+    cams_present = []
     for cam in range(1, NUM_CAMS + 1):
         vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
         if not os.path.exists(vid):
@@ -91,152 +526,65 @@ def main():
             print(f"  WARNING: cannot open {vid}")
             cap.release()
             continue
-        caps[cam] = cap
+        if fps is None:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        VIDEO_PATHS[cam] = vid
+        cams_present.append(cam)
 
-    if not caps:
+    if not cams_present:
         print(f"ERROR: no synced videos found in {SYNCED_DIR}")
         raise SystemExit(1)
-    if REF_CAM not in caps:
+    if REF_CAM not in cams_present:
         print(f"ERROR: synced video for reference cam {REF_CAM} not found")
         raise SystemExit(1)
 
-    total_frames = int(caps[REF_CAM].get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = caps[REF_CAM].get(cv2.CAP_PROP_FPS)
-    print(f"Loaded {len(caps)} cameras, {total_frames} frames @ {fps:.2f} fps")
-    print(f"Reference: cam{REF_CAM}")
-
-    # Load existing adjustments if present (resume editing)
-    offsets = {cam: 0 for cam in caps}
-    if os.path.exists(SAVE_PATH):
+    # Resume from previous adjustments if present.
+    initial_offsets = {f"cam{c}": 0 for c in cams_present}
+    if os.path.exists(save_path):
         try:
-            with open(SAVE_PATH) as f:
+            with open(save_path) as f:
                 saved = json.load(f)
-            for cam in caps:
-                v = saved.get("frame_offsets", {}).get(f"cam{cam}")
+            for c in cams_present:
+                v = saved.get("frame_offsets", {}).get(f"cam{c}")
                 if v is not None:
-                    offsets[cam] = int(v)
-            print(f"Resumed from {os.path.basename(SAVE_PATH)}: "
-                  f"{ {f'cam{c}': offsets[c] for c in caps} }")
+                    initial_offsets[f"cam{c}"] = int(v)
+            print(f"  Resumed from {save_path}: {initial_offsets}")
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"WARNING: could not load {SAVE_PATH}: {e}")
+            print(f"  WARNING: could not load {save_path}: {e}")
 
-    # Layout
-    grid_cols, grid_rows = grid_layout(len(caps))
-    fig = plt.figure(figsize=(max(10, grid_cols * 2.5), grid_rows * 2 + 3.5))
-    fig.suptitle(
-        f"Sync visualizer — {SESSION}   "
-        f"(cam{REF_CAM} = reference, ±2 frames per cam)",
-        fontsize=11,
-    )
+    grid_cols, grid_rows = grid_layout(len(cams_present))
 
-    # Video axes
-    video_axes = {}
-    img_artists = {}
-    cams_sorted = sorted(caps.keys())
-    for i, cam in enumerate(cams_sorted):
-        r = i // grid_cols
-        c = i % grid_cols
-        ax_left = 0.005 + c * (1.0 / grid_cols)
-        ax_w = (1.0 / grid_cols) * 0.97
-        # Top region: y in [0.30, 0.95]
-        top, bot = 0.95, 0.30
-        ax_h = (top - bot) / grid_rows * 0.92
-        ax_bottom = top - (r + 1) * ((top - bot) / grid_rows) + 0.01
-        ax = fig.add_axes([ax_left, ax_bottom, ax_w, ax_h])
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_title(f"cam{cam}{' (ref)' if cam == REF_CAM else ''}",
-                     color="red" if cam == REF_CAM else "black", fontsize=9)
-        artist = ax.imshow(np.zeros((100, 100, 3), dtype=np.uint8))
-        video_axes[cam] = ax
-        img_artists[cam] = artist
+    META.update({
+        "session": SESSION,
+        "ref_cam": REF_CAM,
+        "fps": fps,
+        "total_frames": total_frames,
+        "cams": cams_present,
+        "grid": {"cols": grid_cols, "rows": grid_rows},
+        "offsets": initial_offsets,
+    })
 
-    # Frame slider
-    init_frame = (args.start_frame if args.start_frame is not None
-                  else max(0, total_frames // 10))
-    ax_frame = fig.add_axes([0.10, 0.22, 0.80, 0.03])
-    frame_slider = Slider(ax_frame, "Frame", 0, max(0, total_frames - 1),
-                          valinit=init_frame, valstep=1)
+    global SAVE_PATH
+    SAVE_PATH = save_path
 
-    # Per-camera offset sliders, in up to two rows
-    offset_sliders = {}
-    n_cams = len(cams_sorted)
-    slider_cols = min(6, n_cams)
-    for i, cam in enumerate(cams_sorted):
-        r = i // slider_cols
-        c = i % slider_cols
-        ax_left = 0.07 + c * (0.86 / slider_cols)
-        ax_w = (0.86 / slider_cols) * 0.85
-        ax_bottom = 0.13 - r * 0.045
-        ax_s = fig.add_axes([ax_left, ax_bottom, ax_w, 0.025])
-        label = f"c{cam}{'*' if cam == REF_CAM else ''}"
-        s = Slider(ax_s, label, -2, 2, valinit=offsets[cam], valstep=1)
-        offset_sliders[cam] = s
+    url = f"http://127.0.0.1:{args.port}/"
+    print("=" * 60)
+    print(f"  Sync visualizer ready")
+    print(f"  Cameras: {cams_present} (ref=cam{REF_CAM})")
+    print(f"  Frames:  {total_frames} @ {fps:.2f} fps "
+          f"({total_frames/fps:.1f}s)")
+    print(f"  URL:     {url}")
+    print(f"  Save to: {save_path}")
+    print(f"  Press Ctrl+C to stop")
+    print("=" * 60)
 
-    # Save button + status
-    ax_save = fig.add_axes([0.45, 0.02, 0.10, 0.045])
-    btn_save = Button(ax_save, "Save")
-    ax_status = fig.add_axes([0.05, 0.02, 0.38, 0.045])
-    ax_status.axis("off")
-    status_text = ax_status.text(0, 0.5, "", fontsize=10)
+    if not args.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
-    # Render helpers — only re-decode what changed for snappy interactivity
-    def render_cam(cam):
-        f = int(frame_slider.val)
-        off = int(offset_sliders[cam].val)
-        target = f + off
-        img = read_frame(caps[cam], target, total_frames)
-        if img is not None:
-            img_artists[cam].set_data(img)
-        video_axes[cam].set_title(
-            f"cam{cam}{' (ref)' if cam == REF_CAM else ''}  "
-            f"f={target} (off={off:+d})",
-            color="red" if cam == REF_CAM else "black", fontsize=9,
-        )
-
-    def render_all():
-        for cam in cams_sorted:
-            render_cam(cam)
-        status_text.set_text("")
-        fig.canvas.draw_idle()
-
-    def on_frame_change(_):
-        render_all()
-
-    def on_offset_change(cam):
-        def cb(_):
-            render_cam(cam)
-            status_text.set_text("")
-            fig.canvas.draw_idle()
-        return cb
-
-    frame_slider.on_changed(on_frame_change)
-    for cam, s in offset_sliders.items():
-        s.on_changed(on_offset_change(cam))
-
-    def on_save(_):
-        out = {
-            "session": SESSION,
-            "ref_cam": REF_CAM,
-            "fps": fps,
-            "total_frames": total_frames,
-            "frame_offsets": {f"cam{c}": int(offset_sliders[c].val)
-                              for c in cams_sorted},
-        }
-        os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
-        with open(SAVE_PATH, "w") as fh:
-            json.dump(out, fh, indent=2)
-        status_text.set_text(f"Saved -> {os.path.basename(SAVE_PATH)}")
-        fig.canvas.draw_idle()
-        print(f"Saved {SAVE_PATH}: {out['frame_offsets']}")
-
-    btn_save.on_clicked(on_save)
-
-    render_all()
-    plt.show()
-
-    for cap in caps.values():
-        cap.release()
+    app.run(host="127.0.0.1", port=args.port,
+            debug=False, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":

@@ -339,12 +339,18 @@ def main():
                       f"trim=duration={cap},setpts=PTS-STARTPTS,")
             filter_str += f"[{idx}:v]{trim_f}scale=-2:{PREVIEW_HEIGHT}[v{cam}];\n"
 
-        # N-camera grid: cols = ceil(sqrt(N)), rows = ceil(N/cols).
-        # Lay out with hstack per row, then vstack the rows. The last row
-        # is padded with black so its width matches the full-width rows.
+        # N-camera grid: bias toward a wider-than-tall layout so each pane
+        # stays readable on a 16:9 screen. For N <= 3 use a single row; else
+        # cols = ceil(N/2), rows = ceil(N/cols). Examples:
+        #   N=2  -> 2x1   N=5  -> 3x2   N=8  -> 4x2   N=12 -> 6x2
+        # Cam 1 is top-left; cameras fill row-major (left-to-right, top-to-bottom).
         import math
-        grid_cols = math.ceil(math.sqrt(NUM_CAMS))
-        grid_rows = math.ceil(NUM_CAMS / grid_cols)
+        if NUM_CAMS <= 3:
+            grid_cols = NUM_CAMS
+            grid_rows = 1
+        else:
+            grid_cols = math.ceil(NUM_CAMS / 2)
+            grid_rows = math.ceil(NUM_CAMS / grid_cols)
         row_labels = []
         cam_iter = iter(range(1, NUM_CAMS + 1))
         for r in range(grid_rows):

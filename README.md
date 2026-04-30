@@ -116,7 +116,7 @@ The pipeline:
 2. Extracts audio, runs `scipy.signal.correlate()` against the reference camera (`--ref-cam`).
 3. Computes per-camera trim offsets and a common duration.
 4. Stream-copies (`-c copy`) each camera's video with the computed trim — no quality loss.
-5. Generates an N-camera grid preview from LRV proxy files (falls back to scaled MP4 if LRV missing). The grid is auto-laid-out as `cols × rows` with `cols = ceil(sqrt(N))`.
+5. Generates an N-camera grid preview from LRV proxy files (falls back to scaled MP4 if LRV missing). Layout is biased wider-than-tall: `N≤3` → single row, otherwise `cols = ceil(N/2)`, `rows = ceil(N/cols)` (so 12 → 6×2, 5 → 3×2, 8 → 4×2). Cam 1 is top-left, filling row-major.
 6. Writes a sync report with sanity checks (confidence, offset magnitude, duration spread).
 
 ### How Sync Works

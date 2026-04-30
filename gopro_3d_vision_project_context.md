@@ -71,6 +71,10 @@ Camera 05:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM05%22
 Camera 06:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM06%22
 Camera 07:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM07%22
 Camera 08:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM08%22
+Camera 09:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM09%22
+Camera 10:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM10%22
+Camera 11:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM11%22
+Camera 12:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM12%22
 ```
 
 Files become e.g. `CAM01GH01xxxx.MP4`.
@@ -158,7 +162,8 @@ Play back synced videos and confirm the clap frame aligns visually across all ca
 - Cross-correlation (`scipy.signal.correlate`) is more robust than peak detection in noisy environments
 - GoPro Hero 10 has NO genlock — over long recordings (10+ min) cameras can drift by 1-2 frames. Clap at both ends to detect drift. If significant, resample/interpolate.
 - Calibration pipeline reads synced videos in lockstep (all cameras on same frame number) — this guarantees stereo calibration pairs see the board in the same pose. Detection is parallelised across cameras within each frame using `findChessboardCornersSB` on downscaled images (~960px), with `cornerSubPix` refinement at full 4K resolution.
-- Extrinsic R, T are expressed as **camN's pose in cam1's frame** (cam1 = origin). OpenCV's `stereoCalibrate` returns the inverse convention, so the output is inverted: `R_inv = R^T`, `T_inv = -R^T · T`.
+- Extrinsic R, T are expressed as **camN's pose in the reference camera's frame** (`--ref-cam`, default cam1, configurable per run). OpenCV's `stereoCalibrate` returns the inverse convention, so the output is inverted: `R_inv = R^T`, `T_inv = -R^T · T`.
+- Within a single camera, GoPro auto-splits long recordings into chapter files (`GX01XXXX.MP4`, `GX02XXXX.MP4`, ...). The sync pipeline detects chapters by abutting `creation_time` tags (next.start ≈ prev.start + prev.duration) and merges them into one logical recording before audio extraction and stream-copy trim, using ffmpeg's `concat` demuxer.
 
 ---
 
@@ -210,7 +215,11 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 
 ## 8. FILES DELIVERED
 
-- `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, preview grid)
-- `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping)
+- `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, N-camera preview grid, chapter merging by `creation_time`)
+- `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping, configurable `--ref-cam`)
+- `run_eval_epipolar.py` — Standalone epipolar-geometry validation (loads calibration JSONs, samples frames, measures point-to-line epipolar distance with outlier rejection)
+- `sync_vis.py` — Interactive matplotlib visualizer for ±2 frame per-camera offset adjustments after auto-sync; writes `output/<session>/sync_adjustments.json`
+- `pyproject.toml` + `uv.lock` — uv project metadata and locked dependencies (numpy, scipy, opencv-python, matplotlib); install with `uv sync`
 - `gopro_hero10_3d_rig_config.txt` — The full camera config with QR URLs, all params, per-camera naming URLs, time sync links, and operational notes
 - `gopro_3d_vision_project_context.md` — This file (full context dump for agent handoff)
+- `README.md` — User-facing documentation: prerequisites, shooting workflow, run commands for each script, output layout, validation checks

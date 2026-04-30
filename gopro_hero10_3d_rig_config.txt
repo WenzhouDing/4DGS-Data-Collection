@@ -49,6 +49,10 @@ Camera 05:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM05%22
 Camera 06:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM06%22
 Camera 07:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM07%22
 Camera 08:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM08%22
+Camera 09:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM09%22
+Camera 10:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM10%22
+Camera 11:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM11%22
+Camera 12:  https://gopro.github.io/labs/control/set/?cmd=!MBASE=%22CAM12%22
 
 ============================================================
   TIME SYNC

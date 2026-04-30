@@ -10,7 +10,7 @@ Frame-accurate sync, intrinsic calibration, and extrinsic (stereo) calibration p
 
 1. **Intrinsic calibration** — All cameras are read in lockstep (same frame numbers) via OpenCV. For each sampled frame, checkerboard detection runs in parallel across cameras using `findChessboardCornersSB` (sector-based, faster than classic) on downscaled frames (~960px wide), then refines at full resolution via `cornerSubPix`. Early stopping fires after `--max-frames` (default 60) frames where ALL cameras detected the board. Each camera's detections then go through `cv2.calibrateCamera()`. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
 
-2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both Camera 1 (reference) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Because detection uses the same frame numbers across cameras (lockstep), shared frames are guaranteed to be truly time-synced. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS.
+2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both the reference camera (configurable via `--ref-cam`) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Because detection uses the same frame numbers across cameras (lockstep), shared frames are guaranteed to be truly time-synced. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS — all expressed in the reference camera's coordinate frame (origin = `--ref-cam`).
 
 Both phases share the same corner detections. Source frame numbers are embedded in filenames (e.g. `frame_000120.jpg` = source frame 120), so matching by filename guarantees temporal correspondence across synced cameras. The lockstep approach ensures all cameras process identical frame numbers — this is critical for stereo calibration accuracy. Detected frames go to a system temp directory and are automatically cleaned up.
 
@@ -29,30 +29,31 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 │   ├── GX010004.MP4
 │   ├── GL010004.LRV
 │   └── ...
-├── 2/ ... 5/                       # Camera 2–5 raw footage
+├── 2/ ... N/                       # Camera 2–N raw footage (12 cams in this project)
 └── output/                         # All pipeline output (gitignored)
     ├── session_01/
     │   ├── synced_raw/
-    │   │   ├── cam1_synced.mp4 ... cam5_synced.mp4
+    │   │   ├── cam1_synced.mp4 ... camN_synced.mp4
     │   ├── session_01_preview.mp4
     │   ├── session_01_sync_report.md
+    │   ├── sync_adjustments.json   # written by sync_vis.py (optional)
     │   └── metadata/
     │       ├── session_01_metadata.json
     │       └── *.THM
     ├── session_02/ ...
     └── calibration/
-        ├── cam1_intrinsics.json ... cam5_intrinsics.json
-        ├── cam2_extrinsics.json ... cam5_extrinsics.json
+        ├── cam1_intrinsics.json ... camN_intrinsics.json
+        ├── cam{i}_extrinsics.json   # one per non-ref camera, in --ref-cam's frame
         ├── calibration_all_cameras.json
         ├── checkerboard_config.json
         ├── frame_extraction_log.json   # source frame numbers used per cam
         └── validation/
-            ├── cam1/ ... cam5/
+            ├── cam1/ ... camN/
             │   ├── corners_frame_*.jpg     # detected vs reprojected corners
             │   └── reproj_error_per_frame.png
             ├── rms_all_cameras.png         # intrinsic RMS comparison
             └── stereo/
-                ├── pair_1_*_cam*.jpg       # epipolar line overlays
+                ├── pair_{REF}_*_cam*.jpg   # epipolar line overlays (REF = --ref-cam)
                 └── stereo_rms.png          # stereo RMS comparison
 ```
 
@@ -196,7 +197,7 @@ The `calibration_all_cameras.json` combines both intrinsics and extrinsics for a
 
 **Stereo RMS** should be under ~1 px for a well-calibrated pair. A large stereo RMS (like 20+ px) indicates a problem — common causes: the board wasn't fully visible to both cameras simultaneously, there's a sync error, or the camera was at a very oblique angle to the board.
 
-**Baselines** should match your physical rig geometry. If cameras are evenly spaced in a line, expect baselines to increase linearly (e.g. 10cm, 20cm, 30cm, 40cm for 10cm spacing).
+**Baselines** are the Euclidean distance from the reference camera (`--ref-cam`) to each other camera, in metres. They should match your physical rig geometry — e.g. for a linear 5-cam rig with 10cm spacing and `--ref-cam 1`, expect baselines `0.10, 0.20, 0.30, 0.40 m`; with `--ref-cam 3` expect `0.20, 0.10, 0.10, 0.20 m` (cam1, cam2, cam4, cam5). The 12-cam 6×2 grid will produce per-pair baselines that match the in-rig distance from your `--ref-cam` to each other camera.
 
 **Euler angles** should be small if cameras are roughly parallel. Large rotations (> 5-10 degrees) might indicate a tilted camera or a calibration issue.
 
@@ -211,8 +212,31 @@ The `validation/` folder contains visual sanity checks:
 **Intrinsic summary** (`validation/rms_all_cameras.png`) — cross-camera RMS comparison bar chart.
 
 **Stereo validation** (`validation/stereo/`):
-- `pair_1_{N}_frame_*_cam1.jpg` and `pair_1_{N}_frame_*_camN.jpg` — epipolar line overlays on 2 sample shared frames per pair. For each coloured dot (a detected checkerboard corner), the corresponding epipolar line is drawn in the other camera's image. The dot in the second image should sit on or very near the line. Large deviations mean the stereo geometry is off.
+- `pair_{REF}_{N}_frame_*_cam{REF}.jpg` and `pair_{REF}_{N}_frame_*_camN.jpg` — epipolar line overlays on 2 sample shared frames per pair (`REF` = `--ref-cam`). For each coloured dot (a detected checkerboard corner), the corresponding epipolar line is drawn in the other camera's image. The dot in the second image should sit on or very near the line. Large deviations mean the stereo geometry is off.
 - `stereo_rms.png` — cross-pair stereo RMS bar chart. Outlier pairs are immediately visible.
+
+## Standalone Epipolar Eval (`run_eval_epipolar.py`)
+
+A separate, post-calibration sanity check that re-detects the checkerboard on a different sample of synced-video frames and measures **point-to-line epipolar distance** for every pair `(ref-cam, camN)`. This is independent of the calibration step's own validation: it reads the saved `cam{N}_intrinsics.json` + `cam{N}_extrinsics.json`, recomputes `F` from `K1, K2, R, T`, undistorts both images and points, and reports `mean / median / p95 / max` of the per-corner epipolar distances.
+
+```bash
+uv run python run_eval_epipolar.py --base . --session session_01 --cams 12 --ref-cam 1
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base` | `.` | Project root |
+| `--session` | `session_01` | Synced session to evaluate |
+| `--cams` | `12` | Number of cameras |
+| `--ref-cam` | `1` | Must match the value used at calibration time |
+| `--board` | `9x12` | Board size as COLSxROWS in squares |
+| `--num-frames` | `10` | Frames to sample (uniformly across the middle 10%–90% of the video) |
+
+Output: `output/calibration/validation/epipolar_eval/`
+- `pair_{REF}_{N}_f<frame>_cam*.jpg` — annotated overlays (green ≤ 1px, yellow ≤ 2px, red > 2px)
+- `epipolar_eval_summary.json` — per-pair statistics
+
+Verdict: **mean < 1 px = good, < 2 px = acceptable, > 2 px = poor**. Frames whose worst point exceeds 10 px are auto-rejected (likely a bad detection or a partially occluded board).
 
 ## GoPro File Types
 

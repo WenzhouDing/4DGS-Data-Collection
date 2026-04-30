@@ -20,7 +20,10 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 .
 ├── sync_pipeline.py                # Multi-session audio sync
 ├── run_calibration.py              # Intrinsic + extrinsic calibration
-├── requirements.txt
+├── run_eval_epipolar.py            # Epipolar-geometry validation
+├── sync_vis.py                     # Interactive ±2-frame sync fine-tune
+├── pyproject.toml                  # uv project metadata + deps
+├── uv.lock                         # uv lockfile
 ├── gopro_hero10_3d_rig_config.txt  # Camera settings + QR code reference
 ├── 1/                              # Camera 1 raw footage (gitignored)
 │   ├── GX010004.MP4
@@ -219,7 +222,30 @@ The `validation/` folder contains visual sanity checks:
 | `GL*.LRV` | Low-res proxy (used for preview generation) |
 | `*.THM`   | JPEG thumbnail |
 
-File numbering differs across cameras — that's why pairing is done by recording order, not filename.
+File numbering differs across cameras — that's why pairing is done by recording order, not filename. Within a single camera, GoPro auto-splits long recordings into chapter files (`GX01XXXX.MP4`, `GX02XXXX.MP4`, ...). The sync pipeline detects these via abutting `creation_time` tags and merges them into one logical recording (using ffmpeg's `concat` demuxer for audio extraction and the stream-copy trim).
+
+## Sync Fine-Tune (`sync_vis.py`)
+
+After running `sync_pipeline.py`, audio-clap sync is usually accurate to within one frame, but residual sub-frame drift can leave a camera 1–2 frames off the visually-correct moment. `sync_vis.py` opens the synced videos in an interactive matplotlib window and lets you nudge each camera by ±2 frames:
+
+```bash
+uv run python sync_vis.py --base . --session session_01 --cams 12 --ref-cam 1
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base` | `.` | Project root |
+| `--session` | `session_01` | Synced session to fine-tune |
+| `--cams` | `12` | Number of cameras |
+| `--ref-cam` | `1` | Reference camera (its offset stays at 0) |
+| `--start-frame` | `total/10` | Initial frame to display |
+
+Controls:
+- **Frame slider** — scrubs across the synced timeline
+- **Per-camera offset slider** (`c1`, `c2`, …, `cN`) — shifts that camera by −2/−1/0/+1/+2 frames relative to the frame slider
+- **Save** — writes `output/<session>/sync_adjustments.json` with the chosen offsets. Re-running the tool resumes from the saved values.
+
+The tool **does not re-trim videos** — it only writes the JSON. Downstream tools that respect this file can apply the offsets when indexing into the synced videos.
 
 ## Next Steps (Not Yet Implemented)
 

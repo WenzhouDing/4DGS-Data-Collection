@@ -44,6 +44,100 @@ def parse_args():
 SAMPLE_RATE = 48000
 
 
+def probe_creation_time(video_path):
+    """Probe creation_time from format tags via ffprobe.
+
+    Returns a timezone-aware datetime, or None if absent/unparseable.
+    GoPro embeds this when the camera clock is set (Precision Time QR or GPS).
+    """
+    from datetime import datetime
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet",
+         "-show_entries", "format_tags=creation_time",
+         "-of", "csv=p=0", video_path],
+        capture_output=True, text=True,
+    )
+    ts = result.stdout.strip()
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def group_chapters(file_paths, durations, creation_times, tol_sec=2.0):
+    """Group chronologically-adjacent files into logical recordings.
+
+    A GoPro auto-splits long recordings into chapter files. Within a camera,
+    chapter N+1's creation_time ≈ chapter N's creation_time + chapter N's
+    duration. Files within `tol_sec` of that expectation are merged.
+
+    Inputs are parallel lists, all aligned by index. Files with missing
+    creation_time are placed in their own group (no merging possible).
+
+    Returns: list of dicts with keys:
+      paths        — list of file paths in chapter order
+      durations    — list of per-file durations (parallel to paths)
+      total_dur    — sum of durations
+      start_time   — datetime of first chapter (or None)
+    """
+    from datetime import timedelta
+    n = len(file_paths)
+    if n == 0:
+        return []
+    # Sort by creation_time (None values go to the end as standalone groups).
+    order = sorted(range(n),
+                   key=lambda i: (creation_times[i] is None,
+                                  creation_times[i] or 0))
+    groups = []
+    current = None
+    for i in order:
+        ct = creation_times[i]
+        if current is None or ct is None or current["start_time"] is None:
+            if current is not None:
+                groups.append(current)
+            current = {"paths": [file_paths[i]],
+                       "durations": [durations[i]],
+                       "start_time": ct}
+            continue
+        prev_end = current["start_time"] + timedelta(seconds=sum(current["durations"]))
+        if abs((ct - prev_end).total_seconds()) <= tol_sec:
+            current["paths"].append(file_paths[i])
+            current["durations"].append(durations[i])
+        else:
+            groups.append(current)
+            current = {"paths": [file_paths[i]],
+                       "durations": [durations[i]],
+                       "start_time": ct}
+    if current is not None:
+        groups.append(current)
+    for g in groups:
+        g["total_dur"] = sum(g["durations"])
+    return groups
+
+
+def write_concat_list(paths, list_path):
+    """Write an ffmpeg concat-demuxer list file. Returns list_path."""
+    with open(list_path, "w") as f:
+        for p in paths:
+            # ffmpeg concat demuxer requires single-quoted absolute paths.
+            f.write(f"file '{os.path.abspath(p)}'\n")
+    return list_path
+
+
+def ffmpeg_input_args(paths, work_dir, tag):
+    """Return ffmpeg input args for one logical recording.
+
+    Single file: ['-i', path]. Multiple chapters: concat demuxer.
+    """
+    if len(paths) == 1:
+        return ["-i", paths[0]]
+    list_path = os.path.join(work_dir, f"concat_{tag}.txt")
+    write_concat_list(paths, list_path)
+    return ["-f", "concat", "-safe", "0", "-i", list_path]
+
+
 def probe_video_fps(video_path):
     """Probe actual FPS from video via ffprobe (e.g. 59.94, 119.88)."""
     result = subprocess.run(
@@ -68,14 +162,19 @@ def probe_video_fps(video_path):
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────
-def extract_audio(video_path, wav_path):
-    """Extract mono 48 kHz WAV from video."""
-    subprocess.run([
-        "ffmpeg", "-y", "-v", "quiet",
-        "-i", video_path,
-        "-vn", "-acodec", "pcm_s16le", "-ac", "1", "-ar", str(SAMPLE_RATE),
-        wav_path
-    ], check=True)
+def extract_audio(video_paths, wav_path, work_dir, tag):
+    """Extract mono 48 kHz WAV from one logical recording (one or more chapters).
+
+    Multiple chapter files are concatenated via the ffmpeg concat demuxer.
+    """
+    paths = [video_paths] if isinstance(video_paths, str) else list(video_paths)
+    input_args = ffmpeg_input_args(paths, work_dir, f"{tag}_audio")
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "quiet"] + input_args
+        + ["-vn", "-acodec", "pcm_s16le",
+           "-ac", "1", "-ar", str(SAMPLE_RATE), wav_path],
+        check=True,
+    )
 
 
 def load_audio(wav_path):
@@ -180,42 +279,74 @@ def main():
     print("STEP 1: Discovering and pairing recording sessions")
     print("=" * 70)
 
-    cam_files = {}
+    # Per-camera: discover raw files, probe durations + creation_times,
+    # then group adjacent chapters (a single auto-split recording) into one
+    # logical recording. After grouping, cam_recordings[cam] is a list whose
+    # length is the number of *logical* recordings for that camera.
+    cam_recordings = {}
     for cam in range(1, NUM_CAMS + 1):
         mp4s = sorted(glob.glob(os.path.join(VIDEO_BASE, str(cam), "*GX*.MP4")))
-        cam_files[cam] = mp4s
-        print(f"  Camera {cam}: {len(mp4s)} recordings — {[os.path.basename(f) for f in mp4s]}")
+        if not mp4s:
+            cam_recordings[cam] = []
+            print(f"  Camera {cam}: 0 files")
+            continue
+        durations = []
+        creation_times = []
+        for f in mp4s:
+            dur_out = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries",
+                 "format=duration", "-of", "csv=p=0", f],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if not dur_out:
+                raise RuntimeError(f"ffprobe could not read duration from {f}")
+            durations.append(float(dur_out))
+            creation_times.append(probe_creation_time(f))
+        groups = group_chapters(mp4s, durations, creation_times)
+        cam_recordings[cam] = groups
+        merged = sum(1 for g in groups if len(g["paths"]) > 1)
+        print(f"  Camera {cam}: {len(mp4s)} files -> {len(groups)} logical "
+              f"recording(s){' (' + str(merged) + ' merged from chapters)' if merged else ''}")
+        for gi, g in enumerate(groups):
+            names = [os.path.basename(p) for p in g["paths"]]
+            ts = g["start_time"].isoformat() if g["start_time"] else "no-creation_time"
+            print(f"    rec {gi+1}: {names}  {g['total_dur']:.2f}s  start={ts}")
 
-    # Pair by recording order (not filename — cameras may have different numbering)
-    empty_cams = [cam for cam, mp4s in cam_files.items() if not mp4s]
+    empty_cams = [cam for cam, recs in cam_recordings.items() if not recs]
     if empty_cams:
         print(f"\nERROR: no GX*.MP4 files found in folder(s) {empty_cams} "
               f"under {VIDEO_BASE}.")
         print("  Check --base, --cams, and that each camera's SD card has "
               "been copied into the matching numbered folder.")
         raise SystemExit(1)
-    num_sessions = min(len(v) for v in cam_files.values())
-    print(f"\n  -> {num_sessions} complete sessions (all {NUM_CAMS} cameras present)")
+
+    # Pair logical recordings across cameras by index (sorted earliest first).
+    # If counts differ, truncate to the minimum and warn.
+    counts = {cam: len(r) for cam, r in cam_recordings.items()}
+    if len(set(counts.values())) > 1:
+        print(f"\n  WARNING: cameras have different recording counts {counts}. "
+              f"Truncating to the minimum.")
+    num_sessions = min(counts.values())
+    print(f"\n  -> {num_sessions} complete session(s) (all {NUM_CAMS} cameras present)")
 
     sessions = {}
     for s in range(num_sessions):
         session_name = f"session_{s + 1:02d}"
         session_files = {}
         for cam in range(1, NUM_CAMS + 1):
-            fpath = cam_files[cam][s]
-            fname = os.path.basename(fpath)
-            dur_out = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-show_entries",
-                 "format=duration", "-of", "csv=p=0", fpath],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if not dur_out:
-                raise RuntimeError(f"ffprobe could not read duration from {fpath}")
-            dur = float(dur_out)
-            session_files[cam] = {"path": fpath, "filename": fname, "duration": dur}
+            rec = cam_recordings[cam][s]
+            primary_name = os.path.basename(rec["paths"][0])
+            session_files[cam] = {
+                "paths": rec["paths"],
+                "filename": primary_name,
+                "filenames": [os.path.basename(p) for p in rec["paths"]],
+                "duration": rec["total_dur"],
+                "start_time": rec["start_time"],
+            }
 
         for cam in range(1, NUM_CAMS + 1):
-            mp4_name = session_files[cam]["filename"]
+            # LRV proxy: only first chapter (preview is short anyway)
+            mp4_name = session_files[cam]["filenames"][0]
             lrv_name = mp4_name.replace("GX", "GL").replace(".MP4", ".LRV")
             lrv_path = os.path.join(VIDEO_BASE, str(cam), lrv_name)
             session_files[cam]["lrv_path"] = lrv_path if os.path.exists(lrv_path) else None
@@ -230,7 +361,8 @@ def main():
         print(f"\n  {session_name}:")
         for cam in range(1, NUM_CAMS + 1):
             f = session_files[cam]
-            print(f"    Cam {cam}: {f['filename']}  {f['duration']:.2f}s  "
+            chap_tag = "" if len(f["paths"]) == 1 else f" (+{len(f['paths'])-1} chapters)"
+            print(f"    Cam {cam}: {f['filename']}{chap_tag}  {f['duration']:.2f}s  "
                   f"LRV={'Y' if f['lrv_path'] else 'N'}  THM={'Y' if f['thm_path'] else 'N'}")
         print(f"    Raw duration spread: {dur_spread:.2f}s {'!! LARGE SPREAD' if dur_spread > 5 else 'OK'}")
 
@@ -246,16 +378,21 @@ def main():
         os.makedirs(synced_dir, exist_ok=True)
         os.makedirs(meta_dir, exist_ok=True)
 
-        # Probe FPS from first camera's video (all cams share same settings)
-        FPS = probe_video_fps(session_files[1]["path"])
+        # Probe FPS from first camera's first chapter (all cams share settings)
+        FPS = probe_video_fps(session_files[1]["paths"][0])
         print(f"\n  Video FPS: {FPS:.4f}")
 
-        # Extract audio
+        # Extract audio (concat chapters if multi-file)
         print("\n  Extracting audio...")
         audio_data = {}
         for cam in range(1, NUM_CAMS + 1):
             wav_path = os.path.join(WORK_DIR, f"{session_name}_cam{cam}.wav")
-            extract_audio(session_files[cam]["path"], wav_path)
+            extract_audio(
+                session_files[cam]["paths"],
+                wav_path,
+                WORK_DIR,
+                f"{session_name}_cam{cam}",
+            )
             rate, data = load_audio(wav_path)
             audio_data[cam] = data
             print(f"    Cam {cam}: {len(data)} samples ({len(data) / rate:.2f}s)")
@@ -310,15 +447,19 @@ def main():
         print(f"    Common synced duration: {common_dur:.2f}s "
               f"({common_dur * FPS:.0f} frames)")
 
-        # Trim raw video (stream copy — no re-encode)
+        # Trim raw video (stream copy — no re-encode). Multi-chapter recordings
+        # go through the concat demuxer; -ss is applied as input-side seek.
         print("\n  Trimming synced raw video...")
         for cam in range(1, NUM_CAMS + 1):
-            inp = session_files[cam]["path"]
+            inp_args = ffmpeg_input_args(
+                session_files[cam]["paths"], WORK_DIR,
+                f"{session_name}_cam{cam}_trim",
+            )
             out = os.path.join(synced_dir, f"cam{cam}_synced.mp4")
             cmd = ["ffmpeg", "-y", "-v", "quiet"]
             if trim_sec[cam] > 0.0001:
                 cmd += ["-ss", f"{trim_sec[cam]:.6f}"]
-            cmd += ["-i", inp, "-t", f"{common_dur:.6f}", "-c", "copy", out]
+            cmd += inp_args + ["-t", f"{common_dur:.6f}", "-c", "copy", out]
             subprocess.run(cmd, check=True)
             out_size = os.path.getsize(out) / (1024 * 1024)
             print(f"    Cam {cam}: -> {os.path.basename(out)} ({out_size:.1f} MB)")
@@ -327,7 +468,8 @@ def main():
         print("\n  Generating synced preview...")
         preview_inputs = []
         for cam in range(1, NUM_CAMS + 1):
-            src = session_files[cam].get("lrv_path") or session_files[cam]["path"]
+            # Preview is short (<= PREVIEW_MAX_SEC), so first chapter is enough.
+            src = session_files[cam].get("lrv_path") or session_files[cam]["paths"][0]
             preview_inputs.append(src)
 
         filter_str = ""
@@ -409,7 +551,7 @@ def main():
                 print(f"    -> {os.path.basename(preview_path)} ({prev_size:.1f} MB)")
             else:
                 print(f"    WARNING: preview failed, falling back to cam{REF_CAM} only")
-                fallback = session_files[REF_CAM].get("lrv_path") or session_files[REF_CAM]["path"]
+                fallback = session_files[REF_CAM].get("lrv_path") or session_files[REF_CAM]["paths"][0]
                 subprocess.run([
                     "ffmpeg", "-y", "-v", "quiet",
                     "-ss", f"{trim_sec[REF_CAM]:.6f}", "-i", fallback,
@@ -434,8 +576,10 @@ def main():
             "cameras": {},
         }
         for cam in range(1, NUM_CAMS + 1):
-            cam_meta = get_video_metadata(session_files[cam]["path"])
+            # Metadata is from the first chapter; record all chapter filenames.
+            cam_meta = get_video_metadata(session_files[cam]["paths"][0])
             cam_meta["source_file"] = session_files[cam]["filename"]
+            cam_meta["source_files"] = session_files[cam]["filenames"]
             cam_meta["trim_sec"] = trim_sec[cam]
             cam_meta["trim_frames"] = trim_sec[cam] * FPS
             cam_meta["offset_samples"] = offsets[cam][0]
@@ -475,8 +619,11 @@ def main():
         for cam in range(1, NUM_CAMS + 1):
             f = session_files[cam]
             conf = offsets[cam][1]
+            label = f["filename"]
+            if len(f["paths"]) > 1:
+                label += f" (+{len(f['paths'])-1} chapters)"
             report.append(
-                f"| Cam {cam} | {f['filename']} | {f['duration']:.2f}s | "
+                f"| Cam {cam} | {label} | {f['duration']:.2f}s | "
                 f"{trim_sec[cam]:.4f}s ({trim_sec[cam] * FPS:.2f}f) | {conf:.4f} |"
             )
 

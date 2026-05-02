@@ -269,15 +269,18 @@ A browser tab opens automatically (Ctrl+C to stop the server). Architecture:
 | `--ref-cam` | `1` | Reference camera (its offset stays at 0) |
 | `--port` | `8765` | Local port for the web UI |
 | `--no-browser` | off | Skip auto-opening a browser tab |
+| `--no-proxy` | off | Serve original 4K HEVC instead of generating a 720p H.264 proxy |
 
 Controls:
 - **Frame slider** at the top — scrubs across the synced timeline
+- **Audio-peak markers** above the slider — one tick per camera at its detected clap moment (cam-1 / ref tick is red); click any tick to jump to that frame. If sync is good, all ticks stack at the same position.
 - **Per-camera ±2 ticks** — click `−2 / −1 / 0 / +1 / +2` for each camera; only that camera reseeks
-- **Save adjustments** button — writes `output/<session>/sync_adjustments.json`. Re-launching resumes from the saved values.
+- **Save adjustments** — writes `output/<session>/sync_adjustments.json`; re-launching resumes from the saved values
+- **Apply to videos** — re-trims `cam{N}_synced.mp4` in place using the current offsets, regenerates proxies, and resets offsets to 0 (the previously-applied values are kept under `previous_offsets` in the JSON for audit). Updates `metadata.json`'s trim values.
 
 Keyboard shortcuts: <kbd>←</kbd>/<kbd>→</kbd> step ±1 frame · <kbd>shift</kbd>+arrow ±10 · <kbd>home</kbd>/<kbd>end</kbd> · <kbd>1</kbd>–<kbd>9</kbd> focus a cam's offset · <kbd>s</kbd> save.
 
-The tool **does not re-trim videos** — it only writes the JSON. Downstream tools that respect this file can apply the offsets when indexing into the synced videos.
+Performance: on first launch the tool generates a 720p H.264 proxy per camera (parallel, ~30 s/cam). Browser HEVC decode of full-res 4K is slow on rapid scrubbing; H.264 720p decodes ~10× faster on macOS hardware. Proxy duration is preserved so frame indices map 1-to-1 with the original full-res `cam{N}_synced.mp4`. Use `--no-proxy` to bypass.
 
 ## Next Steps (Not Yet Implemented)
 

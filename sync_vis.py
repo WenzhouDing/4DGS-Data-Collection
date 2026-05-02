@@ -43,6 +43,11 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 from flask import Flask, jsonify, request, send_file, Response
 
+# Re-use chapter-merge / concat-demuxer helpers from the sync pipeline so
+# the Apply endpoint goes through the same ffmpeg input plumbing as the
+# original sync (no logic duplication).
+from sync_pipeline import ffmpeg_input_args
+
 
 PROXY_HEIGHT = 720           # H.264 proxy height; faster decode than 4K HEVC
 PROXY_BITRATE = "2500k"      # plenty for visual sync verification
@@ -203,6 +208,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   button:hover { background: var(--accent-hover); }
   button:active { transform: scale(0.98); }
+  button:disabled { background: #4a5160; cursor: wait; opacity: 0.6; }
+  button.danger { background: #b85d00; }
+  button.danger:hover { background: #d97706; }
+  .header-buttons { display: flex; gap: 8px; }
   .help-text { color: var(--muted); font-size: 11px; }
   .frame-bar {
     display: flex; align-items: center; gap: 12px;
@@ -330,7 +339,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
 <header>
   <h1>Sync Visualizer — <span class="session" id="session-name">…</span></h1>
-  <button id="save-btn">Save adjustments</button>
+  <div class="header-buttons">
+    <button id="save-btn">Save adjustments</button>
+    <button id="apply-btn" class="danger">Apply to videos</button>
+  </div>
 </header>
 
 <div class="frame-bar">
@@ -447,8 +459,9 @@ async function init() {
     updateFrameDisplay();
   });
 
-  // Save
+  // Save / Apply
   $("save-btn").addEventListener("click", save);
+  $("apply-btn").addEventListener("click", apply);
 
   // Keyboard shortcuts
   document.addEventListener("keydown", onKey);
@@ -611,6 +624,53 @@ async function save() {
   }
 }
 
+async function apply() {
+  const nonZero = CAMS.filter(c => offsets[`cam${c}`] !== 0);
+  if (nonZero.length === 0) {
+    setStatus("All offsets are 0 — nothing to apply.");
+    return;
+  }
+  const summary = nonZero.map(c => `cam${c}=${fmt(offsets[`cam${c}`])}`).join(", ");
+  if (!confirm(
+    `Re-trim cam*_synced.mp4 with these offsets?\n\n  ${summary}\n\n` +
+    `This rewrites the synced videos in place (and regenerates proxies). ` +
+    `Offsets reset to 0 afterward; the previous values are recorded in ` +
+    `sync_adjustments.json.previous_offsets.\n\n` +
+    `Takes ~30-60s for 5 cams, longer for 12.`
+  )) return;
+  setStatus("Applying… re-trimming videos and regenerating proxies (30-60s)…");
+  $("apply-btn").disabled = true;
+  $("save-btn").disabled = true;
+  document.querySelectorAll(".tick").forEach(b => b.disabled = true);
+  try {
+    const r = await fetch("/apply", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({frame_offsets: offsets}),
+    });
+    const data = await r.json();
+    if (data.status === "ok") {
+      const w = (data.warnings && data.warnings.length)
+        ? ` · warnings: ${data.warnings.join("; ")}` : "";
+      setStatus(
+        `Applied ${new Date().toLocaleTimeString()}: new common_dur=` +
+        `${data.new_common_dur.toFixed(3)}s (${data.new_total_frames} frames)` +
+        w + " · reloading…", true);
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      setStatus(`Apply failed: ${data.error || 'unknown'}`);
+      $("apply-btn").disabled = false;
+      $("save-btn").disabled = false;
+      document.querySelectorAll(".tick").forEach(b => b.disabled = false);
+    }
+  } catch (e) {
+    setStatus(`Apply error: ${e.message}`);
+    $("apply-btn").disabled = false;
+    $("save-btn").disabled = false;
+    document.querySelectorAll(".tick").forEach(b => b.disabled = false);
+  }
+}
+
 function fmt(v) { return v >= 0 ? `+${v}` : `${v}`; }
 
 function setStatus(msg, ok) {
@@ -634,6 +694,7 @@ app = Flask(__name__)
 VIDEO_PATHS = {}
 META = {}
 SAVE_PATH = ""
+USE_PROXY = True
 
 
 @app.route("/")
@@ -643,7 +704,10 @@ def index():
 
 @app.route("/metadata")
 def metadata():
-    return jsonify(META)
+    # _base is server-internal (used by /apply to find raw camera files);
+    # don't leak the project path to the browser.
+    public = {k: v for k, v in META.items() if not k.startswith("_")}
+    return jsonify(public)
 
 
 @app.route("/video/<int:cam>")
@@ -680,6 +744,175 @@ def save_offsets():
         json.dump(out, f, indent=2)
     print(f"  Saved offsets -> {SAVE_PATH}: {cleaned}")
     return jsonify({"status": "ok", "path": SAVE_PATH})
+
+
+@app.route("/apply", methods=["POST"])
+def apply_offsets():
+    """Re-trim original raw videos with the offsets baked in.
+
+    Reads incoming offsets (POST body or saved sync_adjustments.json), looks
+    up each cam's source files + original trim_sec from metadata.json, and
+    re-runs ffmpeg trim+concat to replace cam{N}_synced.mp4 in place.
+    Stale proxies are deleted and regenerated.  metadata.json is updated
+    with the new trim values; sync_adjustments.json offsets are reset to 0
+    (with the previously-applied values stashed under previous_offsets).
+    """
+    base = META["_base"]
+    session = META["session"]
+    fps = META["fps"]
+    cams = META["cams"]
+
+    # 1. Choose offsets: POST body wins, fall back to last saved.
+    body = request.get_json(silent=True) or {}
+    incoming = body.get("frame_offsets")
+    if not incoming and os.path.exists(SAVE_PATH):
+        try:
+            with open(SAVE_PATH) as f:
+                incoming = json.load(f).get("frame_offsets", {})
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if not incoming:
+        return jsonify({"status": "error", "error": "no offsets to apply"}), 400
+
+    cleaned = {}
+    for c in cams:
+        key = f"cam{c}"
+        try:
+            v = int(incoming.get(key, 0))
+        except (TypeError, ValueError):
+            return jsonify({"status": "error",
+                            "error": f"non-int offset for {key}"}), 400
+        if v < -2 or v > 2:
+            return jsonify({"status": "error",
+                            "error": f"{key} offset out of range"}), 400
+        cleaned[key] = v
+
+    if all(v == 0 for v in cleaned.values()):
+        return jsonify({"status": "error",
+                        "error": "all offsets are 0; nothing to apply"}), 400
+
+    # 2. Load metadata.json for source paths + original trim values.
+    meta_path = os.path.join(base, "output", session, "metadata",
+                             f"{session}_metadata.json")
+    if not os.path.exists(meta_path):
+        return jsonify({"status": "error",
+                        "error": f"metadata not found: {meta_path}"}), 400
+    try:
+        with open(meta_path) as f:
+            session_meta = json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        return jsonify({"status": "error",
+                        "error": f"could not read metadata: {e}"}), 400
+
+    cams_meta = session_meta.get("cameras", {})
+
+    # 3. Compute new trim per cam (clamped to >= 0).
+    new_trims = {}
+    raw_durs = {}
+    source_paths = {}
+    warnings = []
+    for c in cams:
+        key = f"cam{c}"
+        cm = cams_meta.get(key, {})
+        original_trim = float(cm.get("trim_sec", 0))
+        offset = cleaned[key]
+        new_trim = original_trim + offset / fps
+        if new_trim < 0:
+            warnings.append(
+                f"{key}: offset {offset:+d} would push trim below 0 "
+                f"(original_trim={original_trim:.4f}s); clamped to 0"
+            )
+            new_trim = 0
+        new_trims[c] = new_trim
+        raw_durs[c] = float(cm.get("duration", 0))
+        names = cm.get("source_files") or [cm.get("source_file")]
+        source_paths[c] = [os.path.join(base, str(c), n) for n in names if n]
+        for p in source_paths[c]:
+            if not os.path.exists(p):
+                return jsonify({"status": "error",
+                                "error": f"source file missing: {p}"}), 400
+
+    new_common_dur = min(raw_durs[c] - new_trims[c] for c in cams)
+
+    # 4. Re-trim each cam (concat demuxer for multi-chapter).
+    synced_dir = os.path.join(base, "output", session, "synced_raw")
+    work_dir = os.path.join(base, ".sync_work")
+    os.makedirs(work_dir, exist_ok=True)
+
+    print(f"  Apply: re-trimming {len(cams)} cam(s) with offsets {cleaned} "
+          f"(new common_dur={new_common_dur:.4f}s)")
+
+    new_synced = {}
+    for c in cams:
+        out = os.path.join(synced_dir, f"cam{c}_synced.mp4")
+        inp_args = ffmpeg_input_args(
+            source_paths[c], work_dir, f"apply_cam{c}",
+        )
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        if new_trims[c] > 0.0001:
+            cmd += ["-ss", f"{new_trims[c]:.6f}"]
+        cmd += inp_args + ["-t", f"{new_common_dur:.6f}", "-c", "copy", out]
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            return jsonify({"status": "error",
+                            "error": f"ffmpeg failed for cam{c}: {e}"}), 500
+        proxy = proxy_path_for(out)
+        if os.path.exists(proxy):
+            os.remove(proxy)
+        new_synced[c] = out
+        print(f"    cam{c}: new_trim={new_trims[c]:.4f}s "
+              f"(offset {cleaned[f'cam{c}']:+d}) -> {os.path.basename(out)}")
+
+    # 5. Regenerate proxies for the new synced videos (if proxy mode).
+    if USE_PROXY:
+        new_proxies = ensure_proxies([new_synced[c] for c in cams])
+        for c in cams:
+            VIDEO_PATHS[c] = new_proxies[new_synced[c]]
+    else:
+        for c in cams:
+            VIDEO_PATHS[c] = new_synced[c]
+
+    # 6. Update metadata.json with new trim values.
+    for c in cams:
+        key = f"cam{c}"
+        if key in cams_meta:
+            cams_meta[key]["trim_sec"] = new_trims[c]
+            cams_meta[key]["trim_frames"] = new_trims[c] * fps
+    session_meta["common_duration_sec"] = new_common_dur
+    session_meta["common_duration_frames"] = int(new_common_dur * fps)
+    with open(meta_path, "w") as f:
+        json.dump(session_meta, f, indent=2, default=str)
+
+    # 7. Reset adjustments JSON; recompute peak frames for the new timeline
+    #    and update server-side META so the next /metadata reflects reality.
+    META["total_frames"] = int(new_common_dur * fps)
+    META["offsets"] = {f"cam{c}": 0 for c in cams}
+    new_peaks = compute_peak_frames(session_meta, fps)
+    META["peak_frames"] = {f"cam{c}": pf for c, pf in new_peaks.items()}
+
+    out_adj = {
+        "session": session,
+        "ref_cam": META["ref_cam"],
+        "fps": fps,
+        "total_frames": META["total_frames"],
+        "frame_offsets": META["offsets"],
+        "previous_offsets": cleaned,
+    }
+    with open(SAVE_PATH, "w") as f:
+        json.dump(out_adj, f, indent=2)
+
+    print(f"  Apply: done. common_dur={new_common_dur:.4f}s, "
+          f"total_frames={META['total_frames']}")
+
+    return jsonify({
+        "status": "ok",
+        "new_common_dur": new_common_dur,
+        "new_total_frames": META["total_frames"],
+        "new_trims": {f"cam{c}": new_trims[c] for c in cams},
+        "warnings": warnings,
+        "applied_offsets": cleaned,
+    })
 
 
 # ─── Main ─────────────────────────────────────────────────────────
@@ -768,7 +1001,11 @@ def main():
         "grid": {"cols": grid_cols, "rows": grid_rows},
         "offsets": initial_offsets,
         "peak_frames": {f"cam{c}": pf for c, pf in peak_frames.items()},
+        "_base": BASE,
     })
+
+    global USE_PROXY
+    USE_PROXY = not args.no_proxy
 
     global SAVE_PATH
     SAVE_PATH = save_path

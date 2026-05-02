@@ -73,6 +73,67 @@ def parse_args():
 VALIDATION_SAMPLE_COUNT = 4
 TOTAL_STEPS = 3
 
+# Wide-baseline bridging tunables. With many cameras (12+ in 2x6 grid), some
+# pairs (e.g. opposite ends of the same row) rarely see the board together
+# and produce a poor or failed direct stereoCalibrate. We compute every
+# viable pair and chain through well-calibrated intermediates when needed.
+MIN_SHARED_FOR_PAIR = 8       # min shared frames to attempt stereoCalibrate
+GOOD_DIRECT_RMS_PX = 1.5      # use direct pair if rms below this; else bridge
+MAX_BRIDGE_HOPS = 6           # cap bridging chain length
+
+
+# ─── TRANSFORM MATH ──────────────────────────────────────────────
+def compose_transforms(R1, T1, R2, T2):
+    """Compose two transforms (A→B then B→C) into A→C.
+
+    Convention: P_out = R @ P_in + T (the cv2.stereoCalibrate output convention).
+    """
+    return R2 @ R1, R2 @ T1 + T2
+
+
+def invert_transform(R, T):
+    """Inverse of (R, T): if P_out = R @ P_in + T, then P_in = R^T @ P_out - R^T @ T."""
+    return R.T, -R.T @ T
+
+
+def fundamental_from_KRT(K1, K2, R, T):
+    """Compute F (p2.T @ F @ p1 = 0 in pixel coords) from intrinsics + extrinsics.
+
+    R, T must be the cam1→cam2 transform.
+    """
+    Tx = np.array([[0, -T[2, 0], T[1, 0]],
+                   [T[2, 0], 0, -T[0, 0]],
+                   [-T[1, 0], T[0, 0], 0]])
+    E = Tx @ R
+    return np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+
+
+def find_bridging_path(ref, target, edges, num_cams, max_hops=MAX_BRIDGE_HOPS):
+    """BFS shortest hop-count path from ref to target through good edges.
+
+    `edges` is a set of (i, j) tuples with i < j. Returns the cam list along
+    the path (e.g. [3, 4, 5, 6]) or None if no path within max_hops.
+    """
+    if ref == target:
+        return [ref]
+    visited = {ref}
+    queue = [(ref, [ref])]
+    while queue:
+        node, path = queue.pop(0)
+        if len(path) - 1 >= max_hops:
+            continue
+        for other in range(1, num_cams + 1):
+            if other in visited:
+                continue
+            if (min(node, other), max(node, other)) not in edges:
+                continue
+            new_path = path + [other]
+            if other == target:
+                return new_path
+            visited.add(other)
+            queue.append((other, new_path))
+    return None
+
 
 # ─── PROGRESS HELPERS ────────────────────────────────────────────
 def step_header(step_num, title):
@@ -544,74 +605,144 @@ def main():
         # ══════════════════════════════════════════════════════════
         # STEP 3: EXTRINSIC (STEREO) CALIBRATION
         # ══════════════════════════════════════════════════════════
-        step_header(3, f"Extrinsic calibration (each cam vs Cam {REF_CAM})")
+        # Strategy for wide-baseline rigs (e.g. 12-cam 2x6 grids): compute
+        # *every* viable pair and build a graph of well-calibrated edges.
+        # For each non-ref cam, prefer the direct pair if its rms meets the
+        # quality bar; otherwise BFS the shortest hop-count path through
+        # good intermediate pairs and chain the transforms.  This recovers
+        # extrinsics for opposite-end cams that don't directly share enough
+        # frames (or where stereoCalibrate is poorly conditioned), at the
+        # cost of one extra stereoCalibrate per pair (~1 min for 12 cams).
+        step_header(3, f"Extrinsic calibration (all pairs, then chain to Cam {REF_CAM})")
 
         ref_cam = REF_CAM
         if intrinsics[ref_cam] is None:
             print(f"  ERROR: Cam {ref_cam} intrinsic calibration failed!")
             raise SystemExit(1)
 
-        K1 = intrinsics[ref_cam]["K"]
-        dist1 = intrinsics[ref_cam]["dist"]
+        stereo_criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6,
+        )
+
+        # ── Step 3a: stereoCalibrate every viable pair (i<j) ─────
+        all_pairs = {}        # (i, j) where i<j -> {R, T, F, rms, shared}
+        n_attempted = n_succeeded = n_skipped_few = 0
+        cam_ids = [c for c in range(1, NUM_CAMS + 1) if intrinsics[c] is not None]
+        for ii, i in enumerate(cam_ids):
+            for j in cam_ids[ii + 1:]:
+                shared = sorted(set(cam_corners[i]) & set(cam_corners[j]))
+                if len(shared) < MIN_SHARED_FOR_PAIR:
+                    n_skipped_few += 1
+                    continue
+                n_attempted += 1
+                obj_pts = [objp] * len(shared)
+                pts_i = [cam_corners[i][fn][0] for fn in shared]
+                pts_j = [cam_corners[j][fn][0] for fn in shared]
+                try:
+                    ret, _, _, _, _, R_ij, T_ij, _, F_ij = cv2.stereoCalibrate(
+                        obj_pts, pts_i, pts_j,
+                        intrinsics[i]["K"], intrinsics[i]["dist"],
+                        intrinsics[j]["K"], intrinsics[j]["dist"],
+                        img_shape,
+                        criteria=stereo_criteria,
+                        flags=cv2.CALIB_FIX_INTRINSIC,
+                    )
+                    all_pairs[(i, j)] = {
+                        "R": R_ij, "T": T_ij, "F": F_ij,
+                        "rms": ret, "shared": shared,
+                    }
+                    n_succeeded += 1
+                    progress(f"\r  Pair {i}-{j}: rms={ret:.3f}px "
+                             f"({len(shared)} shared)" + " " * 20)
+                except cv2.error as e:
+                    progress(f"\r  Pair {i}-{j}: FAILED ({e})" + " " * 20 + "\n", end="")
+        print()
+        print(f"  All-pairs: {n_succeeded}/{n_attempted} converged "
+              f"({n_skipped_few} skipped for <{MIN_SHARED_FOR_PAIR} shared)")
+
+        # ── Step 3b: graph of "good" edges for bridging ──────────
+        good_edges = {(i, j) for (i, j), p in all_pairs.items()
+                      if p["rms"] <= GOOD_DIRECT_RMS_PX}
+        print(f"  Graph: {len(good_edges)} edges meet quality bar "
+              f"(rms ≤ {GOOD_DIRECT_RMS_PX:.1f}px) for bridging")
+
+        def pair_lookup(i, j):
+            """Get (R_i_to_j, T_i_to_j, info) for any direction; None if missing."""
+            key = (min(i, j), max(i, j))
+            if key not in all_pairs:
+                return None
+            p = all_pairs[key]
+            if i < j:
+                return p["R"], p["T"], p
+            R_inv, T_inv = invert_transform(p["R"], p["T"])
+            return R_inv, T_inv, p
+
+        # ── Step 3c: pick best path per cam, compose transforms ──
         extrinsics = {}
         stereo_rms_map = {}
+        method_summary = {"direct": 0, "direct_low_quality": 0,
+                          "bridged": 0, "no_path": 0}
 
         for cam in range(1, NUM_CAMS + 1):
-            if cam == ref_cam:
-                continue
-            if intrinsics[cam] is None:
-                print(f"  Pair {ref_cam}-{cam}: SKIP — cam {cam} intrinsics failed")
+            if cam == ref_cam or intrinsics[cam] is None:
                 continue
 
-            K2 = intrinsics[cam]["K"]
-            dist2 = intrinsics[cam]["dist"]
+            direct = pair_lookup(ref_cam, cam)
+            use_direct = (direct is not None
+                          and direct[2]["rms"] <= GOOD_DIRECT_RMS_PX)
 
-            # Match by frame name — encodes source frame number,
-            # so same name = same source frame = same timestamp.
-            ref_names = set(cam_corners[ref_cam].keys())
-            other_names = set(cam_corners[cam].keys())
-            shared = sorted(ref_names & other_names)
+            R_chain = T_chain = None
+            method = path = path_rms = None
+            F_for_viz = None  # only set for direct pairs we can validate visually
 
-            if len(shared) < 8:
-                print(f"  Pair {ref_cam}-{cam}: SKIP — "
-                      f"{len(shared)} shared frames (need >= 8)")
-                continue
+            if use_direct:
+                R_chain, T_chain, info = direct
+                F_for_viz = info["F"]
+                path = [ref_cam, cam]
+                path_rms = [info["rms"]]
+                method = "direct"
+                method_summary["direct"] += 1
+            else:
+                bridged = find_bridging_path(ref_cam, cam, good_edges, NUM_CAMS)
+                if bridged is None:
+                    if direct is not None:
+                        # No bridge available; use the (low-quality) direct anyway
+                        R_chain, T_chain, info = direct
+                        F_for_viz = info["F"]
+                        path = [ref_cam, cam]
+                        path_rms = [info["rms"]]
+                        method = (f"direct (low quality: rms={info['rms']:.2f}px "
+                                  f"> {GOOD_DIRECT_RMS_PX}; no bridge available)")
+                        method_summary["direct_low_quality"] += 1
+                    else:
+                        print(f"  Cam {cam}: NO PATH from cam{ref_cam} "
+                              f"(no direct pair; no bridge through good edges)")
+                        method_summary["no_path"] += 1
+                        continue
+                else:
+                    R_chain, T_chain = np.eye(3), np.zeros((3, 1))
+                    path = bridged
+                    path_rms = []
+                    for k in range(len(bridged) - 1):
+                        R_k, T_k, info_k = pair_lookup(bridged[k], bridged[k + 1])
+                        R_chain, T_chain = compose_transforms(
+                            R_chain, T_chain, R_k, T_k)
+                        path_rms.append(info_k["rms"])
+                    # Derive F for the bridged ref->cam transform so epipolar
+                    # validation still works downstream.
+                    F_for_viz = fundamental_from_KRT(
+                        intrinsics[ref_cam]["K"], intrinsics[cam]["K"],
+                        R_chain, T_chain)
+                    method = f"bridged via {'->'.join(map(str, bridged))}"
+                    method_summary["bridged"] += 1
 
-            progress(
-                f"  Pair {ref_cam}-{cam}: calibrating ({len(shared)} shared)...",
-                end="")
+            # Invert to "camN's pose in ref's frame"
+            R_inv, T_inv = invert_transform(R_chain, T_chain)
+            baseline_m = float(np.linalg.norm(T_inv))
 
-            obj_pts_shared = [objp] * len(shared)
-            pts1 = [cam_corners[ref_cam][fn][0] for fn in shared]
-            pts2 = [cam_corners[cam][fn][0] for fn in shared]
-
-            flags = cv2.CALIB_FIX_INTRINSIC
-            stereo_criteria = (
-                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                100, 1e-6,
-            )
-
-            try:
-                ret, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
-                    obj_pts_shared, pts1, pts2,
-                    K1, dist1, K2, dist2,
-                    img_shape,
-                    criteria=stereo_criteria,
-                    flags=flags,
-                )
-            except cv2.error as e:
-                print(f"\r  Pair {ref_cam}-{cam}: FAILED — stereoCalibrate "
-                      f"raised: {e}                                   ")
-                continue
-
-            # Invert to get camN's pose in the reference camera's frame.
-            # stereoCalibrate gives P_camN = R * P_ref + T
-            # We want camN in ref: R_inv = R^T, T_inv = -R^T * T
-            R_inv = R.T
-            T_inv = -R.T @ T
-
-            baseline_m = np.linalg.norm(T_inv)
-            sy = np.sqrt(R_inv[0, 0]**2 + R_inv[1, 0]**2)
+            # Euler decomp (R = Rx · Ry · Rz; cv2 column-vec convention).
+            # Branch handles gimbal lock when ey ≈ ±π/2.
+            sy = np.sqrt(R_inv[0, 0] ** 2 + R_inv[1, 0] ** 2)
             if sy > 1e-6:
                 ex = np.arctan2(R_inv[2, 1], R_inv[2, 2])
                 ey = np.arctan2(-R_inv[2, 0], sy)
@@ -621,29 +752,33 @@ def main():
                 ey = np.arctan2(-R_inv[2, 0], sy)
                 ez = 0
 
-            stereo_rms_map[f"{ref_cam}-{cam}"] = ret
+            # Aggregate quality: max link RMS along the path (worst link
+            # dominates). For direct pairs this just equals the direct rms.
+            agg_rms = max(path_rms) if path_rms else float("nan")
+            stereo_rms_map[f"{ref_cam}-{cam}"] = agg_rms
 
             progress(
-                f"\r  Pair {ref_cam}-{cam}: RMS={ret:.4f}px  "
+                f"  Pair {ref_cam}-{cam}: rms={agg_rms:.3f}px  "
                 f"baseline={baseline_m*100:.2f}cm  "
                 f"T=[{T_inv[0,0]:.4f}, {T_inv[1,0]:.4f}, {T_inv[2,0]:.4f}]m  "
-                f"({len(shared)} shared)          ")
+                f"[{method}]                 \n", end="")
 
             ext_data = {
                 "reference": f"cam{ref_cam}",
                 "target": f"cam{cam}",
                 "R": R_inv.tolist(),
                 "T": T_inv.flatten().tolist(),
-                "E": E.tolist(),
-                "F": F.tolist(),
-                "stereo_rms_px": round(ret, 6),
+                "F": F_for_viz.tolist() if F_for_viz is not None else None,
+                "stereo_rms_px": round(agg_rms, 6),
                 "baseline_m": round(baseline_m, 6),
                 "euler_deg": {
                     "rx": round(np.degrees(ex), 4),
                     "ry": round(np.degrees(ey), 4),
                     "rz": round(np.degrees(ez), 4),
                 },
-                "shared_frames": len(shared),
+                "method": method,
+                "path": path,
+                "path_rms": [round(r, 6) for r in path_rms],
             }
             extrinsics[cam] = ext_data
 
@@ -651,38 +786,47 @@ def main():
             with open(ext_path, "w") as f:
                 json.dump(ext_data, f, indent=2)
 
-            # Epipolar validation — undistort images and points so F is valid
-            sample_shared = [shared[0], shared[len(shared) // 2]]
-            for fn in sample_shared:
-                fpath1 = cam_corners[ref_cam][fn][1]
-                fpath2 = cam_corners[cam][fn][1]
-                img1 = cv2.undistort(cv2.imread(fpath1), K1, dist1)
-                img2 = cv2.undistort(cv2.imread(fpath2), K2, dist2)
+            # Epipolar validation images — only meaningful for direct pairs
+            # (bridged pairs have no shared frames between ref and cam).
+            if use_direct:
+                shared = direct[2]["shared"]
+                K1 = intrinsics[ref_cam]["K"]
+                dist1 = intrinsics[ref_cam]["dist"]
+                K2 = intrinsics[cam]["K"]
+                dist2 = intrinsics[cam]["dist"]
+                sample_shared = [shared[0], shared[len(shared) // 2]]
+                for fn in sample_shared:
+                    fpath1 = cam_corners[ref_cam][fn][1]
+                    fpath2 = cam_corners[cam][fn][1]
+                    img1 = cv2.undistort(cv2.imread(fpath1), K1, dist1)
+                    img2 = cv2.undistort(cv2.imread(fpath2), K2, dist2)
+                    c1 = cv2.undistortPoints(
+                        cam_corners[ref_cam][fn][0].reshape(-1, 1, 2),
+                        K1, dist1, P=K1).reshape(-1, 2)
+                    c2 = cv2.undistortPoints(
+                        cam_corners[cam][fn][0].reshape(-1, 1, 2),
+                        K2, dist2, P=K2).reshape(-1, 2)
+                    vis1, vis2 = draw_epipolar_lines(img1, img2, c1, c2, F_for_viz)
+                    vis1 = scale_image(vis1)
+                    vis2 = scale_image(vis2)
+                    base = fn.replace(".jpg", "")
+                    p1 = os.path.join(STEREO_VAL,
+                                      f"pair_{ref_cam}_{cam}_{base}_cam{ref_cam}.jpg")
+                    p2 = os.path.join(STEREO_VAL,
+                                      f"pair_{ref_cam}_{cam}_{base}_cam{cam}.jpg")
+                    cv2.imwrite(p1, vis1, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    cv2.imwrite(p2, vis2, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-                c1 = cv2.undistortPoints(
-                    cam_corners[ref_cam][fn][0].reshape(-1, 1, 2),
-                    K1, dist1, P=K1).reshape(-1, 2)
-                c2 = cv2.undistortPoints(
-                    cam_corners[cam][fn][0].reshape(-1, 1, 2),
-                    K2, dist2, P=K2).reshape(-1, 2)
-
-                vis1, vis2 = draw_epipolar_lines(img1, img2, c1, c2, F)
-                vis1 = scale_image(vis1)
-                vis2 = scale_image(vis2)
-
-                base = fn.replace(".jpg", "")
-                p1 = os.path.join(STEREO_VAL,
-                                  f"pair_{ref_cam}_{cam}_{base}_cam{ref_cam}.jpg")
-                p2 = os.path.join(STEREO_VAL,
-                                  f"pair_{ref_cam}_{cam}_{base}_cam{cam}.jpg")
-                cv2.imwrite(p1, vis1, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                cv2.imwrite(p2, vis2, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        print(f"\n  Methods used: direct={method_summary['direct']}, "
+              f"direct_low_quality={method_summary['direct_low_quality']}, "
+              f"bridged={method_summary['bridged']}, "
+              f"no_path={method_summary['no_path']}")
 
         if stereo_rms_map:
             make_bar_chart(
                 list(stereo_rms_map.values()),
                 [f"Cam {k}" for k in stereo_rms_map.keys()],
-                "Stereo Calibration RMS — All Pairs",
+                "Stereo Calibration RMS — All Pairs (worst link if bridged)",
                 "Stereo RMS (px)",
                 os.path.join(STEREO_VAL, "stereo_rms.png"),
             )
@@ -706,12 +850,15 @@ def main():
                 entry["error"] = "intrinsic calibration failed"
 
             if cam in extrinsics:
+                e = extrinsics[cam]
                 entry["extrinsics"] = {
                     "reference": f"cam{REF_CAM}",
-                    "R": extrinsics[cam]["R"],
-                    "T": extrinsics[cam]["T"],
-                    "stereo_rms_px": extrinsics[cam]["stereo_rms_px"],
-                    "baseline_m": extrinsics[cam]["baseline_m"],
+                    "R": e["R"],
+                    "T": e["T"],
+                    "stereo_rms_px": e["stereo_rms_px"],
+                    "baseline_m": e["baseline_m"],
+                    "method": e["method"],
+                    "path": e["path"],
                 }
             cam_data[f"cam{cam}"] = entry
 
@@ -782,9 +929,9 @@ def main():
                 e = extrinsics[cam]
                 print(f"    Pair {REF_CAM}-{cam}: RMS={e['stereo_rms_px']:.4f}px  "
                       f"baseline={e['baseline_m']*100:.2f}cm  "
-                      f"({e['shared_frames']} shared)")
+                      f"[{e['method']}]")
             else:
-                print(f"    Pair {REF_CAM}-{cam}: FAILED")
+                print(f"    Pair {REF_CAM}-{cam}: FAILED (no path)")
 
         print(f"\n  Output: {OUTPUT}/")
         print("  Done!")

@@ -19,8 +19,9 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 ```
 .
 ├── sync_pipeline.py                # Multi-session audio sync
-├── run_calibration.py              # Intrinsic + extrinsic calibration
+├── run_calibration.py              # Intrinsic + extrinsic calibration (with bridging)
 ├── run_eval_epipolar.py            # Epipolar-geometry validation
+├── viz_calibration.py              # 3D camera-pose visualizer (Plotly HTML)
 ├── sync_vis.py                     # Interactive ±2-frame sync fine-tune
 ├── pyproject.toml                  # uv project metadata + deps
 ├── uv.lock                         # uv lockfile
@@ -170,7 +171,17 @@ Detected frames go through `cv2.calibrateCamera()`. The output per camera is a m
 
 Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both the reference camera (`--ref-cam`) and camera N detected the board at the same source frame number. Because Phase 1 processes all cameras in lockstep on the same frame numbers, shared frames are guaranteed to be truly time-synced (same physical moment, board in same pose). With `--max-frames 60`, at least 60 such shared frames are guaranteed for every camera pair.
 
-For each pair (ref-cam, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The raw stereoCalibrate output is inverted so that R and T express **camN's pose in the reference camera's coordinate frame** (ref-cam = origin). The output per pair:
+For each candidate pair, `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The raw stereoCalibrate output is inverted so that R and T express **camN's pose in the reference camera's coordinate frame** (ref-cam = origin).
+
+**Bridging for wide-baseline rigs.** With many cameras (e.g. a 12-cam 2×6 grid), some `(ref, N)` pairs rarely share enough frames — `stereoCalibrate` either skips for too few shared frames or returns a poor RMS. Phase 2 first computes **every viable `(i, j)` pair** (~`N(N-1)/2` calls; ~1 min added for 12 cams) and builds a graph of edges that meet a quality bar (`shared ≥ 8 frames` AND `rms ≤ 1.5 px`). For each non-ref camera, the script prefers the direct `(ref, N)` pair if it meets the quality bar; otherwise it BFS-searches the **shortest hop-count path** from `ref` to `N` through good edges and chains the transforms. Each per-cam JSON records the path used:
+
+```json
+"method": "bridged via 3->5->6",
+"path": [3, 5, 6],
+"path_rms": [0.928, 0.955]
+```
+
+The output per pair:
 
 ```json
 {
@@ -189,7 +200,33 @@ For each pair (ref-cam, camN), `cv2.stereoCalibrate()` runs with the `CALIB_FIX_
 
 `R` is the 3x3 rotation of camN relative to the reference. `T` is camN's optical center position in the reference's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from the reference's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only.
 
-The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters.
+The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters. Each camera's `extrinsics` block also carries `method` and `path` so you can audit which pairs were direct vs. bridged.
+
+## 3D Camera-Pose Visualizer (`viz_calibration.py`)
+
+Reads `calibration_all_cameras.json` and renders every camera as a frustum in the reference camera's coordinate frame, with hover tooltips showing K, intrinsic/stereo RMS, baseline, and (for bridged cams) the chain of intermediates used.
+
+```bash
+uv run python viz_calibration.py --base . [--show]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base` | `.` | Project root |
+| `--out` | `output/calibration/camera_poses.html` | Output HTML path |
+| `--show` | off | Open in browser after generating |
+| `--frustum-depth` | `0.05` | Frustum length in metres (visualization scale only) |
+
+The output is a self-contained HTML file (Plotly with embedded JS — works fully offline). Camera color-coding:
+
+| Color | Meaning |
+|---|---|
+| 🔴 red | reference camera (origin) |
+| 🟢 green | direct stereoCalibrate, RMS ≤ 1.5 px |
+| 🟡 amber | bridged via intermediate cameras |
+| ⚪ gray | direct used despite poor RMS (no bridge available) |
+
+Use this to **qualitatively verify** the calibration: a well-calibrated 6×2 GoPro grid should appear as two evenly-spaced rows of frustums all roughly facing the same direction. Outlier baselines or bizarre orientations are immediately visible.
 
 ### What to Look For
 

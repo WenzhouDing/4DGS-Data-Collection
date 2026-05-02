@@ -35,11 +35,63 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 from flask import Flask, jsonify, request, send_file, Response
+
+
+PROXY_HEIGHT = 720           # H.264 proxy height; faster decode than 4K HEVC
+PROXY_BITRATE = "2500k"      # plenty for visual sync verification
+PROXY_PRESET = "veryfast"    # fast encode; this is one-shot
+
+
+def proxy_path_for(synced_mp4):
+    """Sibling proxy file path for a given synced MP4."""
+    base, _ = os.path.splitext(synced_mp4)
+    return f"{base}_proxy.mp4"
+
+
+def generate_proxy(synced_mp4):
+    """Re-encode synced video to a 720p H.264 proxy (idempotent: skips if newer than source)."""
+    out = proxy_path_for(synced_mp4)
+    if (os.path.exists(out)
+            and os.path.getmtime(out) >= os.path.getmtime(synced_mp4)
+            and os.path.getsize(out) > 0):
+        return out, False  # cached
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", synced_mp4,
+        "-vf", f"scale=-2:{PROXY_HEIGHT}",
+        "-c:v", "libx264", "-preset", PROXY_PRESET, "-b:v", PROXY_BITRATE,
+        "-pix_fmt", "yuv420p",  # broadest browser compat
+        "-an",                  # vis tool doesn't need audio in the proxy
+        "-movflags", "+faststart",
+        out,
+    ]
+    subprocess.run(cmd, check=True)
+    return out, True
+
+
+def ensure_proxies(synced_mp4s):
+    """Generate proxies for all synced videos in parallel; returns {original: proxy}."""
+    proxies = {}
+    if not synced_mp4s:
+        return proxies
+    print(f"  Checking proxies for {len(synced_mp4s)} cam(s) (720p H.264 for fast browser decode)...")
+    n_workers = min(len(synced_mp4s), max(1, (os.cpu_count() or 4) // 2))
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(generate_proxy, src): src for src in synced_mp4s}
+        for fut in futures:
+            src = futures[fut]
+            out, generated = fut.result()
+            proxies[src] = out
+            tag = "generated" if generated else "cached"
+            print(f"    {os.path.basename(src)} -> {os.path.basename(out)}  [{tag}]")
+    return proxies
 
 
 # ─── CLI ──────────────────────────────────────────────────────────
@@ -54,6 +106,10 @@ def parse_args():
                    help="Local port for the web UI")
     p.add_argument("--no-browser", action="store_true",
                    help="Don't auto-open a browser tab")
+    p.add_argument("--no-proxy", action="store_true",
+                   help="Serve the original 4K HEVC instead of generating "
+                        "a 720p H.264 proxy. Slower seeking; useful for "
+                        "verifying the proxy isn't masking issues.")
     return p.parse_args()
 
 
@@ -279,6 +335,7 @@ async function init() {
     grid.appendChild(cell);
     videos[c] = v;
     offsetTagEls[c] = tag;
+    bindSeekQueue(c);
   });
 
   // Offset rows
@@ -325,11 +382,18 @@ async function init() {
   // Keyboard shortcuts
   document.addEventListener("keydown", onKey);
 
-  // Wait for all videos to have loadedmetadata, then initial seek.
+  // Wait for all videos to report duration. cv2's CAP_PROP_FRAME_COUNT is
+  // unreliable for HEVC — use the reference cam's actual decoded duration
+  // (via HTML5 video) as truth.
   await Promise.all(CAMS.map(c => new Promise(res => {
     if (videos[c].readyState >= 1) res();
     else videos[c].addEventListener("loadedmetadata", () => res(), { once: true });
   })));
+  const refDur = videos[REF].duration;
+  if (Number.isFinite(refDur) && refDur > 0) {
+    TOTAL = Math.floor(refDur * FPS);
+    fs.max = TOTAL - 1;
+  }
 
   currentFrame = Math.floor(TOTAL * 0.1);
   fs.value = currentFrame;
@@ -357,14 +421,36 @@ function seekAll() {
   CAMS.forEach(seekCam);
 }
 
+// Per-cam seek queue: only one outstanding seek per video at a time.
+// Rapid slider drags would otherwise pile up cancellable seeks faster
+// than the decoder can complete them, leaving the video frame stale.
+const pending = {};
+
 function seekCam(c) {
+  const v = videos[c];
   const o = offsets[`cam${c}`];
   let target = currentFrame + o;
   if (target < 0) target = 0;
   if (target > TOTAL - 1) target = TOTAL - 1;
   // Seek to mid-frame timestamp to avoid landing on a boundary.
-  videos[c].currentTime = (target + 0.5) / FPS;
+  const t = (target + 0.5) / FPS;
   offsetTagEls[c].textContent = `f=${target} ${o >= 0 ? '+' : ''}${o}`;
+  if (v.seeking) {
+    // Coalesce: remember the latest target; flush on the next 'seeked'.
+    pending[c] = t;
+  } else {
+    v.currentTime = t;
+  }
+}
+
+function bindSeekQueue(c) {
+  videos[c].addEventListener("seeked", () => {
+    if (pending[c] !== undefined) {
+      const t = pending[c];
+      delete pending[c];
+      videos[c].currentTime = t;
+    }
+  });
 }
 
 function updateFrameDisplay() {
@@ -516,6 +602,7 @@ def main():
     fps = None
     total_frames = None
     cams_present = []
+    originals = {}
     for cam in range(1, NUM_CAMS + 1):
         vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
         if not os.path.exists(vid):
@@ -530,8 +617,19 @@ def main():
             fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-        VIDEO_PATHS[cam] = vid
+        originals[cam] = vid
         cams_present.append(cam)
+
+    # Generate (or reuse) 720p H.264 proxies for fast browser decoding.
+    # Browser decodes 720p H.264 ~10x faster than 4K HEVC; offsets stay
+    # accurate because the proxy preserves the original duration.
+    if not args.no_proxy:
+        proxies = ensure_proxies([originals[c] for c in cams_present])
+        for c in cams_present:
+            VIDEO_PATHS[c] = proxies[originals[c]]
+    else:
+        for c in cams_present:
+            VIDEO_PATHS[c] = originals[c]
 
     if not cams_present:
         print(f"ERROR: no synced videos found in {SYNCED_DIR}")

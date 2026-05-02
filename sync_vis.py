@@ -718,20 +718,40 @@ def video(cam):
     return send_file(path, mimetype="video/mp4", conditional=True)
 
 
+def _validate_offsets(incoming, cams):
+    """Validate that incoming has an int in [-2,2] for every cam.
+
+    Returns (cleaned_dict, None) on success or (None, error_response) on
+    failure. Refuses partial bodies — every cam must be specified — so a
+    malformed POST can't silently zero out the user's saved offsets.
+    """
+    if not isinstance(incoming, dict) or not incoming:
+        return None, (jsonify({"status": "error",
+                               "error": "missing or empty frame_offsets"}), 400)
+    cleaned = {}
+    for cam in cams:
+        key = f"cam{cam}"
+        if key not in incoming:
+            return None, (jsonify({"status": "error",
+                                   "error": f"frame_offsets missing {key}"}), 400)
+        try:
+            v = int(incoming[key])
+        except (TypeError, ValueError):
+            return None, (jsonify({"status": "error",
+                                   "error": f"non-int offset for {key}"}), 400)
+        if v < -2 or v > 2:
+            return None, (jsonify({"status": "error",
+                                   "error": f"{key} offset out of range"}), 400)
+        cleaned[key] = v
+    return cleaned, None
+
+
 @app.route("/save", methods=["POST"])
 def save_offsets():
     data = request.get_json(silent=True) or {}
-    incoming = data.get("frame_offsets", {})
-    cleaned = {}
-    for cam in META["cams"]:
-        key = f"cam{cam}"
-        try:
-            v = int(incoming.get(key, 0))
-        except (TypeError, ValueError):
-            return jsonify({"status": "error", "error": f"non-int offset for {key}"}), 400
-        if v < -2 or v > 2:
-            return jsonify({"status": "error", "error": f"{key} out of range"}), 400
-        cleaned[key] = v
+    cleaned, err = _validate_offsets(data.get("frame_offsets"), META["cams"])
+    if err is not None:
+        return err
     out = {
         "session": META["session"],
         "ref_cam": META["ref_cam"],
@@ -742,6 +762,7 @@ def save_offsets():
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
     with open(SAVE_PATH, "w") as f:
         json.dump(out, f, indent=2)
+    META["offsets"] = cleaned
     print(f"  Saved offsets -> {SAVE_PATH}: {cleaned}")
     return jsonify({"status": "ok", "path": SAVE_PATH})
 
@@ -762,30 +783,14 @@ def apply_offsets():
     fps = META["fps"]
     cams = META["cams"]
 
-    # 1. Choose offsets: POST body wins, fall back to last saved.
+    # Require body. Earlier design fell back to sync_adjustments.json when
+    # body was missing, but that meant an empty/malformed POST silently
+    # triggered re-trim against the last-saved values — a footgun. Apply is
+    # destructive; require the caller to spell out exactly what to apply.
     body = request.get_json(silent=True) or {}
-    incoming = body.get("frame_offsets")
-    if not incoming and os.path.exists(SAVE_PATH):
-        try:
-            with open(SAVE_PATH) as f:
-                incoming = json.load(f).get("frame_offsets", {})
-        except (json.JSONDecodeError, ValueError):
-            pass
-    if not incoming:
-        return jsonify({"status": "error", "error": "no offsets to apply"}), 400
-
-    cleaned = {}
-    for c in cams:
-        key = f"cam{c}"
-        try:
-            v = int(incoming.get(key, 0))
-        except (TypeError, ValueError):
-            return jsonify({"status": "error",
-                            "error": f"non-int offset for {key}"}), 400
-        if v < -2 or v > 2:
-            return jsonify({"status": "error",
-                            "error": f"{key} offset out of range"}), 400
-        cleaned[key] = v
+    cleaned, err = _validate_offsets(body.get("frame_offsets"), cams)
+    if err is not None:
+        return err
 
     if all(v == 0 for v in cleaned.values()):
         return jsonify({"status": "error",

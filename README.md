@@ -189,16 +189,17 @@ The output per pair:
   "target": "cam5",
   "R": [[...], [...], [...]],
   "T": [tx, ty, tz],
-  "E": [[...], [...], [...]],
   "F": [[...], [...], [...]],
-  "stereo_rms_px": 0.4096,
-  "baseline_m": 0.0999,
+  "stereo_rms_px": 0.928,
+  "baseline_m": 0.281,
   "euler_deg": {"rx": -0.87, "ry": 0.01, "rz": -0.29},
-  "shared_frames": 41
+  "method": "direct",
+  "path": [3, 5],
+  "path_rms": [0.928]
 }
 ```
 
-`R` is the 3x3 rotation of camN relative to the reference. `T` is camN's optical center position in the reference's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from the reference's viewpoint). `baseline_m` is `‖T‖`. `E` and `F` are the essential and fundamental matrices (from the original stereoCalibrate, not inverted). `stereo_rms_px` is the stereo reprojection error. `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only.
+`R` is the 3x3 rotation of camN relative to the reference. `T` is camN's optical center position in the reference's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from the reference's viewpoint). `baseline_m` is `‖T‖`. `F` is the fundamental matrix in pixel coordinates (for direct pairs, from `stereoCalibrate`; for bridged pairs, derived from chained `K, R, T`). `stereo_rms_px` is the stereo reprojection error — for direct pairs this is the `stereoCalibrate` rms; for bridged pairs it is the **maximum link rms along the chain** (worst weak link in the path). `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only. `method` and `path` record whether the extrinsics came from a direct pair or were chained through intermediates (e.g. `"bridged via 3->5->6"`, `path: [3, 5, 6]`, `path_rms: [0.928, 0.955]`).
 
 The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters. Each camera's `extrinsics` block also carries `method` and `path` so you can audit which pairs were direct vs. bridged.
 
@@ -232,7 +233,7 @@ Use this to **qualitatively verify** the calibration: a well-calibrated 6×2 GoP
 
 **Intrinsic RMS** should be under ~0.5 px for GoPro Wide at 4K. Values above 1px suggest poor board visibility, motion blur, or too few frames.
 
-**Stereo RMS** should be under ~1 px for a well-calibrated pair. A large stereo RMS (like 20+ px) indicates a problem — common causes: the board wasn't fully visible to both cameras simultaneously, there's a sync error, or the camera was at a very oblique angle to the board.
+**Stereo RMS** should be under ~1 px for a well-calibrated pair. A large stereo RMS (like 20+ px) indicates a problem — common causes: the board wasn't fully visible to both cameras simultaneously, there's a sync error, or the camera was at a very oblique angle to the board. For **bridged pairs** the reported `stereo_rms_px` is the worst link in the chain (`max(path_rms)`); inspect `path_rms` in the JSON if a bridged pair looks borderline — one weak intermediate hop dominates the score.
 
 **Baselines** are the Euclidean distance from the reference camera (`--ref-cam`) to each other camera, in metres. They should match your physical rig geometry — e.g. for a linear 5-cam rig with 10cm spacing and `--ref-cam 1`, expect baselines `0.10, 0.20, 0.30, 0.40 m`; with `--ref-cam 3` expect `0.20, 0.10, 0.10, 0.20 m` (cam1, cam2, cam4, cam5). The 12-cam 6×2 grid will produce per-pair baselines that match the in-rig distance from your `--ref-cam` to each other camera.
 
@@ -295,7 +296,8 @@ uv run python sync_vis.py --base . --session session_01 --cams 12 --ref-cam 1
 
 A browser tab opens automatically (Ctrl+C to stop the server). Architecture:
 - **Flask** backend serves the synced MP4s with HTTP Range support — the browser only fetches what it needs.
-- **HTML5 `<video>` elements** in a CSS grid use the browser's hardware HEVC decoder. Setting `video.currentTime` is much faster than `cv2.VideoCapture` seeking, and the GPU compositor keeps the multi-camera grid smooth.
+- **HTML5 `<video>` elements** in a CSS grid, decoded via the browser's hardware video pipeline. By default the server serves a **720p H.264 proxy** per camera (lazily generated on first launch); the browser decodes these ~10× faster than 4K HEVC, which is what makes scrubbing across N cams smooth. Frame indices map 1-to-1 with the original full-res `cam{N}_synced.mp4` because the proxy preserves duration. `--no-proxy` falls back to serving the original (slower).
+- **Per-cam seek queue**: only one outstanding `currentTime` set per `<video>` at a time; the latest target is queued and flushed on `seeked`. Prevents the freeze that rapid slider drags would otherwise cause.
 - **Single-page UI** (no React, no build step) — just an embedded HTML/CSS/JS template in `sync_vis.py`.
 
 | Flag | Default | Description |
@@ -317,7 +319,7 @@ Controls:
 
 Keyboard shortcuts: <kbd>←</kbd>/<kbd>→</kbd> step ±1 frame · <kbd>shift</kbd>+arrow ±10 · <kbd>home</kbd>/<kbd>end</kbd> · <kbd>1</kbd>–<kbd>9</kbd> focus a cam's offset · <kbd>s</kbd> save.
 
-Performance: on first launch the tool generates a 720p H.264 proxy per camera (parallel, ~30 s/cam). Browser HEVC decode of full-res 4K is slow on rapid scrubbing; H.264 720p decodes ~10× faster on macOS hardware. Proxy duration is preserved so frame indices map 1-to-1 with the original full-res `cam{N}_synced.mp4`. Use `--no-proxy` to bypass.
+Performance: on first launch the tool generates a 720p H.264 proxy per camera (parallel, ~30 s/cam). Subsequent launches reuse the cached proxies (proxy is regenerated only if its source `cam{N}_synced.mp4` is newer). Use `--no-proxy` to bypass and serve originals.
 
 ## Next Steps (Not Yet Implemented)
 

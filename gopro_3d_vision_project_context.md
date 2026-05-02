@@ -164,6 +164,7 @@ Play back synced videos and confirm the clap frame aligns visually across all ca
 - Calibration pipeline reads synced videos in lockstep (all cameras on same frame number) — this guarantees stereo calibration pairs see the board in the same pose. Detection is parallelised across cameras within each frame using `findChessboardCornersSB` on downscaled images (~960px), with `cornerSubPix` refinement at full 4K resolution.
 - Extrinsic R, T are expressed as **camN's pose in the reference camera's frame** (`--ref-cam`, default cam1, configurable per run). OpenCV's `stereoCalibrate` returns the inverse convention, so the output is inverted: `R_inv = R^T`, `T_inv = -R^T · T`.
 - Within a single camera, GoPro auto-splits long recordings into chapter files (`GX01XXXX.MP4`, `GX02XXXX.MP4`, ...). The sync pipeline detects chapters by abutting `creation_time` tags (next.start ≈ prev.start + prev.duration) and merges them into one logical recording before audio extraction and stream-copy trim, using ffmpeg's `concat` demuxer.
+- **Bridging for wide-baseline rigs**: with many cameras (e.g. 12 in 2×6), some opposite-end pairs barely share frames or fail `stereoCalibrate`. The calibration script first computes every viable `(i, j)` pair, builds a graph of edges meeting `shared ≥ 8` AND `rms ≤ 1.5 px`, then BFS-finds the shortest hop-count path through good edges for any non-direct cam, and chains the transforms (`R_AC = R_BC · R_AB`, `T_AC = R_BC · T_AB + T_BC`). Per-cam JSONs record the `method` and `path`. F for bridged pairs is derived from the chained `K, R, T` so epipolar visualisation still works.
 
 ---
 
@@ -215,11 +216,26 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 
 ## 8. FILES DELIVERED
 
-- `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, N-camera preview grid, chapter merging by `creation_time`)
-- `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping, configurable `--ref-cam`)
+- `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, N-camera preview grid, chapter merging by `creation_time` + ffmpeg concat demuxer, configurable `--ref-cam`)
+- `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping, configurable `--ref-cam`, **all-pairs + bridging** through good intermediate cameras for wide-baseline rigs)
 - `run_eval_epipolar.py` — Standalone epipolar-geometry validation (loads calibration JSONs, samples frames, measures point-to-line epipolar distance with outlier rejection)
-- `sync_vis.py` — Local Flask web server + HTML5 `<video>` grid for ±2 frame per-camera offset adjustments after auto-sync; writes `output/<session>/sync_adjustments.json`. Uses macOS hardware HEVC decode + GPU compositing for smooth scrubbing.
-- `pyproject.toml` + `uv.lock` — uv project metadata and locked dependencies (numpy, scipy, opencv-python, matplotlib); install with `uv sync`
+- `sync_vis.py` — Local Flask web server + HTML5 `<video>` grid for ±2 frame per-camera offset adjustments after auto-sync. Lazy 720p H.264 proxy generation for fast browser decode; per-video seek queue prevents pile-ups on rapid scrub; clap-peak markers above the timeline; **Apply** button re-trims the synced videos in place using current offsets (reuses `sync_pipeline.ffmpeg_input_args` so chapter-merging works the same way) and resets adjustments to 0 with `previous_offsets` recorded.
+- `viz_calibration.py` — 3D camera-pose viewer (Plotly self-contained HTML). Each camera rendered as a frustum in the reference frame; hover tooltips show K, intrinsic/stereo RMS, baseline, method, and (for bridged cams) the path of intermediates used.
+- `pyproject.toml` + `uv.lock` — uv project metadata and locked dependencies (numpy, scipy, opencv-python, matplotlib, flask, plotly); install with `uv sync`
 - `gopro_hero10_3d_rig_config.txt` — The full camera config with QR URLs, all params, per-camera naming URLs, time sync links, and operational notes
 - `gopro_3d_vision_project_context.md` — This file (full context dump for agent handoff)
 - `README.md` — User-facing documentation: prerequisites, shooting workflow, run commands for each script, output layout, validation checks
+
+### Genericity boundary (what's GoPro-specific vs camera-agnostic)
+
+**GoPro-specific** (would need editing for other camera vendors):
+- `sync_pipeline.py:288` — file glob pattern `*GX*.MP4` (GoPro uses GX/GH prefix). Other cameras would need a different pattern.
+- LRV proxy lookup (`replace("GX","GL").replace(".MP4",".LRV")`) — GoPro chapter format. Falls back to scaled MP4 if absent, so non-GoPro sources work but with slower preview generation.
+- THM thumbnail copy is best-effort; absent thumbnails are silently skipped.
+- README/docstring banners and the camera-config file are written for Hero 10.
+
+**Camera-agnostic** (works for any video source feeding the same on-disk layout):
+- All calibration math (`cv2.calibrateCamera`, `cv2.stereoCalibrate`, bridging BFS, transform composition) — pure OpenCV and numpy, no GoPro assumptions.
+- The N-camera preview grid heuristic, the `--ref-cam` parameter, the audio sync algorithm.
+- `sync_vis.py` (HTTP Range, HTML5 video, proxy generation), `run_eval_epipolar.py`, `viz_calibration.py`.
+- The `cv2.VideoCapture` pipeline is codec-agnostic via `-c copy` for trims.

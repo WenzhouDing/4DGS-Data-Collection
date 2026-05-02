@@ -76,6 +76,49 @@ def generate_proxy(synced_mp4):
     return out, True
 
 
+def load_session_metadata(base, session):
+    """Load output/<session>/metadata/<session>_metadata.json. Returns dict or None."""
+    path = os.path.join(base, "output", session, "metadata",
+                        f"{session}_metadata.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def compute_peak_frames(meta, fps):
+    """Convert each camera's raw clap_peak sample number to a synced-frame index.
+
+      peak_frame_synced = (peak_sample / sample_rate - trim_sec) * fps
+
+    Returns {cam_int: peak_frame_int}; cams whose peak fell before the trim
+    boundary (i.e. would be negative) are omitted.
+    """
+    if not meta:
+        return {}
+    sample_rate = meta.get("sample_rate", 48000)
+    out = {}
+    for cam_key, cam_meta in meta.get("cameras", {}).items():
+        if not cam_key.startswith("cam"):
+            continue
+        try:
+            cam_n = int(cam_key[3:])
+        except ValueError:
+            continue
+        peak_sample = cam_meta.get("clap_peak", {}).get("sample")
+        trim_sec = cam_meta.get("trim_sec", 0)
+        if peak_sample is None:
+            continue
+        peak_synced_sec = (peak_sample / sample_rate) - trim_sec
+        if peak_synced_sec < 0:
+            continue
+        out[cam_n] = int(round(peak_synced_sec * fps))
+    return out
+
+
 def ensure_proxies(synced_mp4s):
     """Generate proxies for all synced videos in parallel; returns {original: proxy}."""
     proxies = {}
@@ -170,9 +213,34 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border-radius: 6px;
   }
   .frame-bar label { font-weight: 500; min-width: 50px; }
-  .frame-bar input[type=range] {
-    flex: 1; height: 6px; accent-color: var(--accent);
+  .slider-wrap { position: relative; flex: 1; }
+  .slider-wrap input[type=range] {
+    width: 100%; height: 6px; accent-color: var(--accent); display: block;
   }
+  .peak-track {
+    position: absolute; top: -12px; left: 8px; right: 8px; height: 10px;
+    pointer-events: none;
+  }
+  .peak-marker {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    background: #fbbf24; opacity: 0.85;
+    pointer-events: auto; cursor: pointer;
+    transform: translateX(-1px);
+    transition: width 0.1s, background 0.1s;
+  }
+  .peak-marker.ref { background: var(--ref); }
+  .peak-marker:hover { width: 4px; transform: translateX(-2px); opacity: 1; }
+  .peak-marker .tooltip {
+    position: absolute; bottom: 100%; left: 50%;
+    transform: translateX(-50%); margin-bottom: 4px;
+    background: #161b22; color: var(--text);
+    padding: 3px 7px; border-radius: 3px; font-size: 11px;
+    white-space: nowrap; pointer-events: none; opacity: 0;
+    transition: opacity 0.1s;
+    font-family: "SF Mono", Menlo, monospace;
+    border: 1px solid var(--border);
+  }
+  .peak-marker:hover .tooltip { opacity: 1; }
   .frame-bar .display {
     font-family: "SF Mono", Menlo, monospace; min-width: 200px;
     text-align: right; color: var(--muted);
@@ -267,7 +335,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 <div class="frame-bar">
   <label>Frame</label>
-  <input type="range" id="frame-slider" min="0" max="0" value="0" step="1">
+  <div class="slider-wrap">
+    <div class="peak-track" id="peak-track"></div>
+    <input type="range" id="frame-slider" min="0" max="0" value="0" step="1">
+  </div>
   <div class="display" id="frame-display">—</div>
 </div>
 
@@ -281,7 +352,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <span><kbd>home</kbd>/<kbd>end</kbd> jump to start/end</span>
   <span><kbd>1</kbd>–<kbd>9</kbd> focus cam offset</span>
   <span><kbd>s</kbd> save</span>
-  <span>Hover a video to see <kbd>frame</kbd> + <kbd>offset</kbd></span>
+  <span>Click a peak marker (above the slider) to jump to that camera's clap moment</span>
 </div>
 
 <div class="status" id="status"></div>
@@ -395,11 +466,39 @@ async function init() {
     fs.max = TOTAL - 1;
   }
 
+  renderPeakMarkers();
+
   currentFrame = Math.floor(TOTAL * 0.1);
   fs.value = currentFrame;
   seekAll();
   updateFrameDisplay();
   setStatus(`Loaded ${CAMS.length} cameras · ${TOTAL} frames @ ${FPS.toFixed(2)} fps · ref=cam${REF}`);
+}
+
+function renderPeakMarkers() {
+  const peaks = (META && META.peak_frames) || {};
+  const track = $("peak-track");
+  track.innerHTML = "";
+  CAMS.forEach(c => {
+    const f = peaks[`cam${c}`];
+    if (f === undefined || f === null) return;
+    const pct = TOTAL > 0 ? (f / (TOTAL - 1)) * 100 : 0;
+    if (pct < 0 || pct > 100) return;
+    const m = document.createElement("div");
+    m.className = "peak-marker" + (c === REF ? " ref" : "");
+    m.style.left = `${pct}%`;
+    const tip = document.createElement("div");
+    tip.className = "tooltip";
+    tip.textContent = `cam${c}${c === REF ? ' (ref)' : ''} clap @ f=${f}`;
+    m.appendChild(tip);
+    m.addEventListener("click", () => {
+      currentFrame = f;
+      $("frame-slider").value = f;
+      seekAll();
+      updateFrameDisplay();
+    });
+    track.appendChild(m);
+  });
 }
 
 function setOffset(c, v) {
@@ -654,6 +753,12 @@ def main():
 
     grid_cols, grid_rows = grid_layout(len(cams_present))
 
+    # Audio clap peak per cam (frame index in the synced timeline) — shown
+    # as clickable markers on the frame slider so the user can jump straight
+    # to the clap moment for visual sync verification.
+    session_meta = load_session_metadata(BASE, SESSION)
+    peak_frames = compute_peak_frames(session_meta, fps)
+
     META.update({
         "session": SESSION,
         "ref_cam": REF_CAM,
@@ -662,6 +767,7 @@ def main():
         "cams": cams_present,
         "grid": {"cols": grid_cols, "rows": grid_rows},
         "offsets": initial_offsets,
+        "peak_frames": {f"cam{c}": pf for c, pf in peak_frames.items()},
     })
 
     global SAVE_PATH

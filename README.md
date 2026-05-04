@@ -4,9 +4,9 @@ Frame-accurate sync, intrinsic calibration, and extrinsic (stereo) calibration p
 
 ## What This Does
 
-**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid with audio, per-session metadata JSON, and a sync report with sanity checks. FPS is probed from the actual video (supports 60fps, 120fps, etc.).
+**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid with audio, per-episode metadata JSON, and a sync report with sanity checks. FPS is probed from the actual video (supports 60fps, 120fps, etc.).
 
-**Calibration pipeline** (`run_calibration.py`) — Two-phase calibration from a synced checkerboard session:
+**Calibration pipeline** (`run_calibration.py`) — Two-phase calibration from a synced checkerboard episode:
 
 1. **Intrinsic calibration** — All cameras are read in lockstep (same frame numbers) via OpenCV. For each sampled frame, checkerboard detection runs in parallel across cameras using `findChessboardCornersSB` (sector-based, faster than classic) on downscaled frames (~960px wide), then refines at full resolution via `cornerSubPix`. Early stopping fires after `--max-frames` (default 60) frames where ALL cameras detected the board. Each camera's detections then go through `cv2.calibrateCamera()`. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
 
@@ -18,7 +18,7 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 
 ```
 .
-├── sync_pipeline.py                # Multi-session audio sync
+├── sync_pipeline.py                # Multi-episode audio sync
 ├── run_calibration.py              # Intrinsic + extrinsic calibration (with bridging)
 ├── run_eval_epipolar.py            # Epipolar-geometry validation
 ├── viz_calibration.py              # 3D camera-pose visualizer (Plotly HTML)
@@ -32,30 +32,34 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 │   └── ...
 ├── 2/ ... N/                       # Camera 2–N raw footage (12 cams in this project)
 └── output/                         # All pipeline output (gitignored)
-    ├── session_01/
+    ├── episode_0001/                # KITTI-style self-contained episode
     │   ├── synced_raw/
     │   │   ├── cam1_synced.mp4 ... camN_synced.mp4
-    │   ├── session_01_preview.mp4
-    │   ├── session_01_sync_report.md
+    │   ├── episode_0001_preview.mp4
+    │   ├── episode_0001_sync_report.md
     │   ├── sync_adjustments.json   # written by sync_vis.py (optional)
-    │   └── metadata/
-    │       ├── session_01_metadata.json
-    │       └── *.THM
-    ├── session_02/ ...
-    └── calibration/
-        ├── cam1_intrinsics.json ... camN_intrinsics.json
-        ├── cam{i}_extrinsics.json   # one per non-ref camera, in --ref-cam's frame
-        ├── calibration_all_cameras.json
-        ├── checkerboard_config.json
-        ├── frame_extraction_log.json   # source frame numbers used per cam
-        └── validation/
-            ├── cam1/ ... camN/
-            │   ├── corners_frame_*.jpg     # detected vs reprojected corners
-            │   └── reproj_error_per_frame.png
-            ├── rms_all_cameras.png         # intrinsic RMS comparison
-            └── stereo/
-                ├── pair_{REF}_*_cam*.jpg   # epipolar line overlays (REF = --ref-cam)
-                └── stereo_rms.png          # stereo RMS comparison
+    │   ├── metadata/
+    │   │   ├── episode_0001_metadata.json
+    │   │   └── *.THM
+    │   └── calibration/             # per-episode calibration (KITTI-style;
+    │       ├── cam1_intrinsics.json ... camN_intrinsics.json
+    │       ├── cam{i}_extrinsics.json   # one per non-ref camera, in --ref-cam's frame
+    │       ├── calibration_all_cameras.json
+    │       ├── checkerboard_config.json
+    │       ├── frame_extraction_log.json   # source frame numbers used per cam
+    │       ├── camera_poses.html       # written by viz_calibration.py
+    │       └── validation/
+    │           ├── cam1/ ... camN/
+    │           │   ├── corners_frame_*.jpg
+    │           │   └── reproj_error_per_frame.png
+    │           ├── rms_all_cameras.png
+    │           └── stereo/
+    │               ├── pair_{REF}_*_cam*.jpg
+    │               └── stereo_rms.png
+    └── episode_0002/ ...             # other episodes can share calibration —
+                                      # organize_episodes.sh duplicates the
+                                      # calibration/ folder into each episode
+                                      # in a group (see "Episode Grouping").
 ```
 
 Raw footage folders (`1/`, `2/`, ...) and `output/` are gitignored — only the scripts, config, and docs are tracked.
@@ -130,13 +134,38 @@ Each camera is started manually, so recording start times differ by several seco
 
 Key detail: `scipy.signal.correlate(ref, other)` returns a positive lag when `other` started **after** `ref`. The trim formula is `trim[cam] = max_offset - offset[cam]` — the camera with the largest offset started earliest and needs the most cut.
 
+## Episode Grouping (`organize_episodes.sh`)
+
+KITTI-style packaging: every `output/episode_NNNN/` is a self-contained dataset with its own `synced_raw/`, `metadata/`, and `calibration/` folder. Some recordings are pure dataset clips and reuse a calibration captured from a different episode of the same shoot — `organize_episodes.sh` runs sync, runs calibration on each "calibration source" episode, and then **copies the calibration folder into every episode that shares it** (intentional duplication, fine for self-contained packages).
+
+```bash
+./organize_episodes.sh --base . --cams 12 --board 9x12 --square-size 0.03 \
+    --ref-cam 3 --groups "1" "2,3,4"
+```
+
+Each `--groups` arg is a comma-separated list of episode indices; the **first index in each group is the calibration source** for the entire group. So `--groups "1" "2,3,4"` means: episode 1 calibrates from itself; episodes 2, 3, and 4 share calibration captured during episode 2.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base` | `.` | Project root |
+| `--cams` | *required* | Number of cameras |
+| `--board` | *required* | Checkerboard size, e.g. `9x12` |
+| `--square-size` | *required* | Square side in metres |
+| `--ref-cam` | `1` | Reference camera for calibration |
+| `--max-frames` | `0` | Calibration `--max-frames` (0 = no cap) |
+| `--groups` | *required* | One arg per group; comma-separated episode indices, first is calib source |
+| `--skip-sync` | off | Don't run `sync_pipeline.py` (assume episodes already synced) |
+| `--skip-calib` | off | Don't run calibration; only copy already-existing calibration folders |
+
+After the script finishes, every `output/episode_NNNN/` is self-contained — drop it on a downstream machine and it has everything needed for 3D reconstruction.
+
 ## Running Calibration
 
-Record a session where a checkerboard is clearly visible from all cameras, then sync it first:
+Record an episode where a checkerboard is clearly visible from all cameras, then sync it first:
 
 ```bash
 uv run python sync_pipeline.py --base . --cams 12
-uv run python run_calibration.py --board 9x12 --square-size 0.03 --base . --session session_01 --cams 12 --ref-cam 3
+uv run python run_calibration.py --board 9x12 --square-size 0.03 --base . --episode episode_0001 --cams 12 --ref-cam 3
 ```
 
 | Flag | Default | Description |
@@ -144,7 +173,7 @@ uv run python run_calibration.py --board 9x12 --square-size 0.03 --base . --sess
 | `--board` | *required* | Board size as COLSxROWS in squares, e.g. `9x12` |
 | `--square-size` | *required* | Checkerboard square side in metres (e.g. `0.03` for 30 mm) |
 | `--base` | `.` | Project root |
-| `--session` | `session_01` | Which synced session to calibrate from |
+| `--episode` | `episode_0001` | Which synced episode to calibrate from |
 | `--cams` | `12` | Number of cameras |
 | `--ref-cam` | `1` | Reference camera (its frame is the world origin; all extrinsics are expressed in it) |
 | `--every` | `30` | Process every Nth frame (30 = ~4fps at 120fps, 1 = all) |
@@ -258,13 +287,13 @@ The `validation/` folder contains visual sanity checks:
 A separate, post-calibration sanity check that re-detects the checkerboard on a different sample of synced-video frames and measures **point-to-line epipolar distance** for every pair `(ref-cam, camN)`. This is independent of the calibration step's own validation: it reads the saved `cam{N}_intrinsics.json` + `cam{N}_extrinsics.json`, recomputes `F` from `K1, K2, R, T`, undistorts both images and points, and reports `mean / median / p95 / max` of the per-corner epipolar distances.
 
 ```bash
-uv run python run_eval_epipolar.py --base . --session session_01 --cams 12 --ref-cam 1
+uv run python run_eval_epipolar.py --base . --episode episode_0001 --cams 12 --ref-cam 1
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `.` | Project root |
-| `--session` | `session_01` | Synced session to evaluate |
+| `--episode` | `episode_0001` | Synced episode to evaluate |
 | `--cams` | `12` | Number of cameras |
 | `--ref-cam` | `1` | Must match the value used at calibration time |
 | `--board` | `9x12` | Board size as COLSxROWS in squares |
@@ -291,7 +320,7 @@ File numbering differs across cameras — that's why pairing is done by recordin
 After running `sync_pipeline.py`, audio-clap sync is usually accurate to within one frame, but residual sub-frame drift can leave a camera 1–2 frames off the visually-correct moment. `sync_vis.py` runs a small **local web server** with a browser-based UI that lets you nudge each camera by ±2 frames using the macOS hardware HEVC decoder for fast, smooth scrubbing:
 
 ```bash
-uv run python sync_vis.py --base . --session session_01 --cams 12 --ref-cam 1
+uv run python sync_vis.py --base . --episode episode_0001 --cams 12 --ref-cam 1
 ```
 
 A browser tab opens automatically (Ctrl+C to stop the server). Architecture:
@@ -303,7 +332,7 @@ A browser tab opens automatically (Ctrl+C to stop the server). Architecture:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `.` | Project root |
-| `--session` | `session_01` | Synced session to fine-tune |
+| `--episode` | `episode_0001` | Synced episode to fine-tune |
 | `--cams` | `12` | Number of cameras |
 | `--ref-cam` | `1` | Reference camera (its offset stays at 0) |
 | `--port` | `8765` | Local port for the web UI |
@@ -314,7 +343,7 @@ Controls:
 - **Frame slider** at the top — scrubs across the synced timeline
 - **Audio-peak markers** above the slider — one tick per camera at its detected clap moment (cam-1 / ref tick is red); click any tick to jump to that frame. If sync is good, all ticks stack at the same position.
 - **Per-camera ±2 ticks** — click `−2 / −1 / 0 / +1 / +2` for each camera; only that camera reseeks
-- **Save adjustments** — writes `output/<session>/sync_adjustments.json`; re-launching resumes from the saved values
+- **Save adjustments** — writes `output/<episode>/sync_adjustments.json`; re-launching resumes from the saved values
 - **Apply to videos** — re-trims `cam{N}_synced.mp4` in place using the current offsets, regenerates proxies, and resets offsets to 0 (the previously-applied values are kept under `previous_offsets` in the JSON for audit). Updates `metadata.json`'s trim values.
 
 Keyboard shortcuts: <kbd>←</kbd>/<kbd>→</kbd> step ±1 frame · <kbd>shift</kbd>+arrow ±10 · <kbd>home</kbd>/<kbd>end</kbd> · <kbd>1</kbd>–<kbd>9</kbd> focus a cam's offset · <kbd>s</kbd> save.

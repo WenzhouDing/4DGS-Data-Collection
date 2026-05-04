@@ -21,11 +21,11 @@ Endpoints
 GET  /            single-page UI
 GET  /metadata    JSON: cams, fps, total_frames, ref_cam, grid, offsets
 GET  /video/<N>   serves cam{N}_synced.mp4 (range-supported)
-POST /save        writes offsets to output/<session>/sync_adjustments.json
+POST /save        writes offsets to output/<episode>/sync_adjustments.json
 
 Usage
 -----
-    uv run python sync_vis.py [--base DIR] [--session SESSION]
+    uv run python sync_vis.py [--base DIR] [--episode EPISODE]
                               [--cams N] [--ref-cam N] [--port PORT]
 
 The browser opens automatically. Ctrl+C to stop the server.
@@ -81,10 +81,10 @@ def generate_proxy(synced_mp4):
     return out, True
 
 
-def load_session_metadata(base, session):
-    """Load output/<session>/metadata/<session>_metadata.json. Returns dict or None."""
-    path = os.path.join(base, "output", session, "metadata",
-                        f"{session}_metadata.json")
+def load_episode_metadata(base, episode):
+    """Load output/<episode>/metadata/<episode>_metadata.json. Returns dict or None."""
+    path = os.path.join(base, "output", episode, "metadata",
+                        f"{episode}_metadata.json")
     if not os.path.exists(path):
         return None
     try:
@@ -146,7 +146,7 @@ def ensure_proxies(synced_mp4s):
 def parse_args():
     p = argparse.ArgumentParser(description="Sync fine-tune visualizer (web UI)")
     p.add_argument("--base", default=".", help="Project root")
-    p.add_argument("--session", default="session_01", help="Synced session")
+    p.add_argument("--episode", default="episode_0001", help="Synced episode")
     p.add_argument("--cams", type=int, default=12, help="Number of cameras")
     p.add_argument("--ref-cam", type=int, default=1,
                    help="Reference camera (its offset stays at 0)")
@@ -199,7 +199,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     margin-bottom: 12px;
   }
   h1 { font-size: 15px; margin: 0; font-weight: 500; letter-spacing: 0.2px; }
-  h1 .session { color: var(--muted); }
+  h1 .episode { color: var(--muted); }
   button {
     background: var(--accent); color: #fff; border: 0;
     padding: 7px 14px; border-radius: 6px; cursor: pointer;
@@ -338,7 +338,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>Sync Visualizer — <span class="session" id="session-name">…</span></h1>
+  <h1>Sync Visualizer — <span class="episode" id="episode-name">…</span></h1>
   <div class="header-buttons">
     <button id="save-btn">Save adjustments</button>
     <button id="apply-btn" class="danger">Apply to videos</button>
@@ -395,7 +395,7 @@ async function init() {
       ? META.offsets[k] : 0;
   });
 
-  $("session-name").textContent = META.session;
+  $("episode-name").textContent = META.episode;
 
   // Video grid
   const grid = $("video-grid");
@@ -753,7 +753,7 @@ def save_offsets():
     if err is not None:
         return err
     out = {
-        "session": META["session"],
+        "episode": META["episode"],
         "ref_cam": META["ref_cam"],
         "fps": META["fps"],
         "total_frames": META["total_frames"],
@@ -779,7 +779,7 @@ def apply_offsets():
     (with the previously-applied values stashed under previous_offsets).
     """
     base = META["_base"]
-    session = META["session"]
+    episode = META["episode"]
     fps = META["fps"]
     cams = META["cams"]
 
@@ -797,19 +797,19 @@ def apply_offsets():
                         "error": "all offsets are 0; nothing to apply"}), 400
 
     # 2. Load metadata.json for source paths + original trim values.
-    meta_path = os.path.join(base, "output", session, "metadata",
-                             f"{session}_metadata.json")
+    meta_path = os.path.join(base, "output", episode, "metadata",
+                             f"{episode}_metadata.json")
     if not os.path.exists(meta_path):
         return jsonify({"status": "error",
                         "error": f"metadata not found: {meta_path}"}), 400
     try:
         with open(meta_path) as f:
-            session_meta = json.load(f)
+            episode_meta = json.load(f)
     except (json.JSONDecodeError, ValueError) as e:
         return jsonify({"status": "error",
                         "error": f"could not read metadata: {e}"}), 400
 
-    cams_meta = session_meta.get("cameras", {})
+    cams_meta = episode_meta.get("cameras", {})
 
     # 3. Compute new trim per cam (clamped to >= 0).
     new_trims = {}
@@ -840,7 +840,7 @@ def apply_offsets():
     new_common_dur = min(raw_durs[c] - new_trims[c] for c in cams)
 
     # 4. Re-trim each cam (concat demuxer for multi-chapter).
-    synced_dir = os.path.join(base, "output", session, "synced_raw")
+    synced_dir = os.path.join(base, "output", episode, "synced_raw")
     work_dir = os.path.join(base, ".sync_work")
     os.makedirs(work_dir, exist_ok=True)
 
@@ -884,20 +884,20 @@ def apply_offsets():
         if key in cams_meta:
             cams_meta[key]["trim_sec"] = new_trims[c]
             cams_meta[key]["trim_frames"] = new_trims[c] * fps
-    session_meta["common_duration_sec"] = new_common_dur
-    session_meta["common_duration_frames"] = int(new_common_dur * fps)
+    episode_meta["common_duration_sec"] = new_common_dur
+    episode_meta["common_duration_frames"] = int(new_common_dur * fps)
     with open(meta_path, "w") as f:
-        json.dump(session_meta, f, indent=2, default=str)
+        json.dump(episode_meta, f, indent=2, default=str)
 
     # 7. Reset adjustments JSON; recompute peak frames for the new timeline
     #    and update server-side META so the next /metadata reflects reality.
     META["total_frames"] = int(new_common_dur * fps)
     META["offsets"] = {f"cam{c}": 0 for c in cams}
-    new_peaks = compute_peak_frames(session_meta, fps)
+    new_peaks = compute_peak_frames(episode_meta, fps)
     META["peak_frames"] = {f"cam{c}": pf for c, pf in new_peaks.items()}
 
     out_adj = {
-        "session": session,
+        "episode": episode,
         "ref_cam": META["ref_cam"],
         "fps": fps,
         "total_frames": META["total_frames"],
@@ -924,7 +924,7 @@ def apply_offsets():
 def main():
     args = parse_args()
     BASE = os.path.abspath(args.base)
-    SESSION = args.session
+    EPISODE = args.episode
     NUM_CAMS = args.cams
     REF_CAM = args.ref_cam
 
@@ -932,8 +932,8 @@ def main():
         print(f"ERROR: --ref-cam {REF_CAM} must be in 1..{NUM_CAMS}")
         raise SystemExit(1)
 
-    SYNCED_DIR = os.path.join(BASE, "output", SESSION, "synced_raw")
-    save_path = os.path.join(BASE, "output", SESSION, "sync_adjustments.json")
+    SYNCED_DIR = os.path.join(BASE, "output", EPISODE, "synced_raw")
+    save_path = os.path.join(BASE, "output", EPISODE, "sync_adjustments.json")
 
     # Probe every available synced video for fps + frame count via cv2.
     fps = None
@@ -994,11 +994,11 @@ def main():
     # Audio clap peak per cam (frame index in the synced timeline) — shown
     # as clickable markers on the frame slider so the user can jump straight
     # to the clap moment for visual sync verification.
-    session_meta = load_session_metadata(BASE, SESSION)
-    peak_frames = compute_peak_frames(session_meta, fps)
+    episode_meta = load_episode_metadata(BASE, EPISODE)
+    peak_frames = compute_peak_frames(episode_meta, fps)
 
     META.update({
-        "session": SESSION,
+        "episode": EPISODE,
         "ref_cam": REF_CAM,
         "fps": fps,
         "total_frames": total_frames,

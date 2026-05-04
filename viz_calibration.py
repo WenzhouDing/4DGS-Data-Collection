@@ -2,7 +2,7 @@
 """
 3D camera-pose visualizer
 =========================
-Reads output/calibration/calibration_all_cameras.json and shows each camera
+Reads output/<episode>/calibration/calibration_all_cameras.json and shows each camera
 as a frustum in the reference camera's coordinate frame. Hovering a camera
 displays its intrinsics, extrinsic method, and quality metrics.
 
@@ -31,8 +31,10 @@ import plotly.graph_objects as go
 def parse_args():
     p = argparse.ArgumentParser(description="3D camera-pose visualizer")
     p.add_argument("--base", default=".", help="Project root")
+    p.add_argument("--episode", default="episode_0001",
+                   help="Episode whose calibration to visualize")
     p.add_argument("--out", default=None,
-                   help="Output HTML path (default: output/calibration/camera_poses.html)")
+                   help="Output HTML path (default: <episode>/calibration/camera_poses.html)")
     p.add_argument("--show", action="store_true",
                    help="Open in browser after generating")
     p.add_argument("--frustum-depth", type=float, default=0.05,
@@ -208,11 +210,12 @@ def add_legend_dummies(traces):
 def main():
     args = parse_args()
     base = os.path.abspath(args.base)
-    calib_path = os.path.join(base, "output", "calibration",
+    episode = args.episode
+    calib_path = os.path.join(base, "output", episode, "calibration",
                               "calibration_all_cameras.json")
     if not os.path.exists(calib_path):
         print(f"ERROR: {calib_path} not found.")
-        print("  Run run_calibration.py first.")
+        print(f"  Run run_calibration.py --episode {episode} first.")
         raise SystemExit(1)
 
     with open(calib_path) as f:
@@ -293,7 +296,7 @@ def main():
     )
 
     out_path = args.out or os.path.join(
-        base, "output", "calibration", "camera_poses.html")
+        base, "output", episode, "calibration", "camera_poses.html")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     # Embed plotly.js so the file works fully offline
     fig.write_html(out_path, include_plotlyjs=True)

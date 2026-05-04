@@ -7,10 +7,10 @@ synced video, detects checkerboard corners, and measures epipolar error
 (point-to-line distance on undistorted images).
 
 Outputs per-pair statistics and validation images to
-  output/calibration/validation/epipolar_eval/
+  output/<episode>/calibration/validation/epipolar_eval/
 
 Usage:
-    python run_eval_epipolar.py [--base DIR] [--session SESSION] [--cams N]
+    python run_eval_epipolar.py [--base DIR] [--episode EPISODE] [--cams N]
                                 [--board COLSxROWS] [--num-frames N]
 """
 
@@ -25,7 +25,7 @@ import sys
 def parse_args():
     p = argparse.ArgumentParser(description="Epipolar geometry validation")
     p.add_argument("--base", default=".", help="Project root")
-    p.add_argument("--session", default="session_01", help="Synced session")
+    p.add_argument("--episode", default="episode_0001", help="Synced episode")
     p.add_argument("--cams", type=int, default=12, help="Number of cameras")
     p.add_argument("--ref-cam", type=int, default=1,
                    help="Reference camera (must match the value used at calibration time)")
@@ -162,7 +162,7 @@ def main():
     args = parse_args()
 
     BASE = os.path.abspath(args.base)
-    SESSION = args.session
+    EPISODE = args.episode
     NUM_CAMS = args.cams
     REF_CAM = args.ref_cam
     NUM_FRAMES = args.num_frames
@@ -182,15 +182,16 @@ def main():
         raise SystemExit(1)
     BOARD_SIZE = (board_cols - 1, board_rows - 1)
 
-    CALIB_DIR = os.path.join(BASE, "output", "calibration")
-    SYNCED_DIR = os.path.join(BASE, "output", SESSION, "synced_raw")
+    # Per-episode calibration (each episode has its own calibration/ folder).
+    CALIB_DIR = os.path.join(BASE, "output", EPISODE, "calibration")
+    SYNCED_DIR = os.path.join(BASE, "output", EPISODE, "synced_raw")
     OUT_DIR = os.path.join(CALIB_DIR, "validation", "epipolar_eval")
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print("=" * 70)
     print("EPIPOLAR GEOMETRY VALIDATION")
     print("=" * 70)
-    print(f"  Session:     {SESSION}")
+    print(f"  Episode:     {EPISODE}")
     print(f"  Cameras:     {NUM_CAMS}")
     print(f"  Reference:   cam{REF_CAM}")
     print(f"  Board:       {board_cols}x{board_rows} -> "
@@ -363,7 +364,7 @@ def main():
 
     # Save summary JSON
     summary = {
-        "session": SESSION,
+        "episode": EPISODE,
         "num_sample_frames": NUM_FRAMES,
         "board": f"{board_cols}x{board_rows}",
         "pairs": pair_results,

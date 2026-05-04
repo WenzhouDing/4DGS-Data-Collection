@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-GoPro Multi-Camera Multi-Session Sync Pipeline
+GoPro Multi-Camera Multi-Episode Sync Pipeline
 ================================================
-Discovers recording sessions by pairing files in order across camera folders,
+Discovers recording episodes by pairing files in order across camera folders,
 uses audio cross-correlation (clap sync) for frame-accurate alignment, then
-outputs per-session synced raw video, a side-by-side preview, sync report,
+outputs per-episode synced raw video, a side-by-side preview, sync report,
 and metadata.
 
 Usage:
@@ -274,9 +274,9 @@ def main():
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(OUTPUT_BASE, exist_ok=True)
 
-    # ── 1. Discover and pair sessions ─────────────────────────────
+    # ── 1. Discover and pair episodes ─────────────────────────────
     print("=" * 70)
-    print("STEP 1: Discovering and pairing recording sessions")
+    print("STEP 1: Discovering and pairing recording episodes")
     print("=" * 70)
 
     # Per-camera: discover raw files, probe durations + creation_times,
@@ -326,17 +326,17 @@ def main():
     if len(set(counts.values())) > 1:
         print(f"\n  WARNING: cameras have different recording counts {counts}. "
               f"Truncating to the minimum.")
-    num_sessions = min(counts.values())
-    print(f"\n  -> {num_sessions} complete session(s) (all {NUM_CAMS} cameras present)")
+    num_episodes = min(counts.values())
+    print(f"\n  -> {num_episodes} complete episode(s) (all {NUM_CAMS} cameras present)")
 
-    sessions = {}
-    for s in range(num_sessions):
-        session_name = f"session_{s + 1:02d}"
-        session_files = {}
+    episodes = {}
+    for s in range(num_episodes):
+        episode_name = f"episode_{s + 1:04d}"
+        episode_files = {}
         for cam in range(1, NUM_CAMS + 1):
             rec = cam_recordings[cam][s]
             primary_name = os.path.basename(rec["paths"][0])
-            session_files[cam] = {
+            episode_files[cam] = {
                 "paths": rec["paths"],
                 "filename": primary_name,
                 "filenames": [os.path.basename(p) for p in rec["paths"]],
@@ -346,52 +346,52 @@ def main():
 
         for cam in range(1, NUM_CAMS + 1):
             # LRV proxy: only first chapter (preview is short anyway)
-            mp4_name = session_files[cam]["filenames"][0]
+            mp4_name = episode_files[cam]["filenames"][0]
             lrv_name = mp4_name.replace("GX", "GL").replace(".MP4", ".LRV")
             lrv_path = os.path.join(VIDEO_BASE, str(cam), lrv_name)
-            session_files[cam]["lrv_path"] = lrv_path if os.path.exists(lrv_path) else None
+            episode_files[cam]["lrv_path"] = lrv_path if os.path.exists(lrv_path) else None
             thm_name = mp4_name.replace(".MP4", ".THM")
             thm_path = os.path.join(VIDEO_BASE, str(cam), thm_name)
-            session_files[cam]["thm_path"] = thm_path if os.path.exists(thm_path) else None
+            episode_files[cam]["thm_path"] = thm_path if os.path.exists(thm_path) else None
 
-        sessions[session_name] = session_files
+        episodes[episode_name] = episode_files
 
-        dur_vals = [session_files[c]["duration"] for c in range(1, NUM_CAMS + 1)]
+        dur_vals = [episode_files[c]["duration"] for c in range(1, NUM_CAMS + 1)]
         dur_spread = max(dur_vals) - min(dur_vals)
-        print(f"\n  {session_name}:")
+        print(f"\n  {episode_name}:")
         for cam in range(1, NUM_CAMS + 1):
-            f = session_files[cam]
+            f = episode_files[cam]
             chap_tag = "" if len(f["paths"]) == 1 else f" (+{len(f['paths'])-1} chapters)"
             print(f"    Cam {cam}: {f['filename']}{chap_tag}  {f['duration']:.2f}s  "
                   f"LRV={'Y' if f['lrv_path'] else 'N'}  THM={'Y' if f['thm_path'] else 'N'}")
         print(f"    Raw duration spread: {dur_spread:.2f}s {'!! LARGE SPREAD' if dur_spread > 5 else 'OK'}")
 
-    # ── 2. Process each session ───────────────────────────────────
-    for session_name, session_files in sessions.items():
+    # ── 2. Process each episode ───────────────────────────────────
+    for episode_name, episode_files in episodes.items():
         print(f"\n{'=' * 70}")
-        print(f"PROCESSING: {session_name}")
+        print(f"PROCESSING: {episode_name}")
         print(f"{'=' * 70}")
 
-        session_out = os.path.join(OUTPUT_BASE, session_name)
-        synced_dir = os.path.join(session_out, "synced_raw")
-        meta_dir = os.path.join(session_out, "metadata")
+        episode_out = os.path.join(OUTPUT_BASE, episode_name)
+        synced_dir = os.path.join(episode_out, "synced_raw")
+        meta_dir = os.path.join(episode_out, "metadata")
         os.makedirs(synced_dir, exist_ok=True)
         os.makedirs(meta_dir, exist_ok=True)
 
         # Probe FPS from first camera's first chapter (all cams share settings)
-        FPS = probe_video_fps(session_files[1]["paths"][0])
+        FPS = probe_video_fps(episode_files[1]["paths"][0])
         print(f"\n  Video FPS: {FPS:.4f}")
 
         # Extract audio (concat chapters if multi-file)
         print("\n  Extracting audio...")
         audio_data = {}
         for cam in range(1, NUM_CAMS + 1):
-            wav_path = os.path.join(WORK_DIR, f"{session_name}_cam{cam}.wav")
+            wav_path = os.path.join(WORK_DIR, f"{episode_name}_cam{cam}.wav")
             extract_audio(
-                session_files[cam]["paths"],
+                episode_files[cam]["paths"],
                 wav_path,
                 WORK_DIR,
-                f"{session_name}_cam{cam}",
+                f"{episode_name}_cam{cam}",
             )
             rate, data = load_audio(wav_path)
             audio_data[cam] = data
@@ -436,7 +436,7 @@ def main():
         max_offset = max(offset_sec.values())
         trim_sec = {cam: max_offset - offset_sec[cam] for cam in range(1, NUM_CAMS + 1)}
 
-        effective_dur = {cam: session_files[cam]["duration"] - trim_sec[cam]
+        effective_dur = {cam: episode_files[cam]["duration"] - trim_sec[cam]
                          for cam in range(1, NUM_CAMS + 1)}
         common_dur = min(effective_dur.values())
 
@@ -452,8 +452,8 @@ def main():
         print("\n  Trimming synced raw video...")
         for cam in range(1, NUM_CAMS + 1):
             inp_args = ffmpeg_input_args(
-                session_files[cam]["paths"], WORK_DIR,
-                f"{session_name}_cam{cam}_trim",
+                episode_files[cam]["paths"], WORK_DIR,
+                f"{episode_name}_cam{cam}_trim",
             )
             out = os.path.join(synced_dir, f"cam{cam}_synced.mp4")
             cmd = ["ffmpeg", "-y", "-v", "quiet"]
@@ -469,7 +469,7 @@ def main():
         preview_inputs = []
         for cam in range(1, NUM_CAMS + 1):
             # Preview is short (<= PREVIEW_MAX_SEC), so first chapter is enough.
-            src = session_files[cam].get("lrv_path") or session_files[cam]["paths"][0]
+            src = episode_files[cam].get("lrv_path") or episode_files[cam]["paths"][0]
             preview_inputs.append(src)
 
         filter_str = ""
@@ -532,7 +532,7 @@ def main():
         else:
             filter_str += f"[{ref_audio_idx}:a]atrim=duration={a_dur},asetpts=PTS-STARTPTS[aout]"
 
-        preview_path = os.path.join(session_out, f"{session_name}_preview.mp4")
+        preview_path = os.path.join(episode_out, f"{episode_name}_preview.mp4")
         cmd = ["ffmpeg", "-y", "-v", "quiet"]
         for src in preview_inputs:
             cmd += ["-i", src]
@@ -551,7 +551,7 @@ def main():
                 print(f"    -> {os.path.basename(preview_path)} ({prev_size:.1f} MB)")
             else:
                 print(f"    WARNING: preview failed, falling back to cam{REF_CAM} only")
-                fallback = session_files[REF_CAM].get("lrv_path") or session_files[REF_CAM]["paths"][0]
+                fallback = episode_files[REF_CAM].get("lrv_path") or episode_files[REF_CAM]["paths"][0]
                 subprocess.run([
                     "ffmpeg", "-y", "-v", "quiet",
                     "-ss", f"{trim_sec[REF_CAM]:.6f}", "-i", fallback,
@@ -566,8 +566,8 @@ def main():
 
         # Save metadata
         print("\n  Saving metadata...")
-        session_meta = {
-            "session_name": session_name,
+        episode_meta = {
+            "episode_name": episode_name,
             "fps": FPS,
             "sample_rate": SAMPLE_RATE,
             "reference_camera": ref_cam,
@@ -577,9 +577,9 @@ def main():
         }
         for cam in range(1, NUM_CAMS + 1):
             # Metadata is from the first chapter; record all chapter filenames.
-            cam_meta = get_video_metadata(session_files[cam]["paths"][0])
-            cam_meta["source_file"] = session_files[cam]["filename"]
-            cam_meta["source_files"] = session_files[cam]["filenames"]
+            cam_meta = get_video_metadata(episode_files[cam]["paths"][0])
+            cam_meta["source_file"] = episode_files[cam]["filename"]
+            cam_meta["source_files"] = episode_files[cam]["filenames"]
             cam_meta["trim_sec"] = trim_sec[cam]
             cam_meta["trim_frames"] = trim_sec[cam] * FPS
             cam_meta["offset_samples"] = offsets[cam][0]
@@ -587,26 +587,26 @@ def main():
             cam_meta["offset_frames"] = offsets[cam][0] / SAMPLE_RATE * FPS
             cam_meta["correlation_confidence"] = offsets[cam][1]
             cam_meta["clap_peak"] = peaks_info[cam]
-            session_meta["cameras"][f"cam{cam}"] = cam_meta
+            episode_meta["cameras"][f"cam{cam}"] = cam_meta
 
-            if session_files[cam]["thm_path"]:
+            if episode_files[cam]["thm_path"]:
                 shutil.copy2(
-                    session_files[cam]["thm_path"],
+                    episode_files[cam]["thm_path"],
                     os.path.join(meta_dir,
-                                 f"cam{cam}_{session_files[cam]['filename'].replace('.MP4', '.THM')}"),
+                                 f"cam{cam}_{episode_files[cam]['filename'].replace('.MP4', '.THM')}"),
                 )
 
-        meta_json_path = os.path.join(meta_dir, f"{session_name}_metadata.json")
+        meta_json_path = os.path.join(meta_dir, f"{episode_name}_metadata.json")
         with open(meta_json_path, "w") as f:
-            json.dump(session_meta, f, indent=2, default=str)
+            json.dump(episode_meta, f, indent=2, default=str)
         print(f"    -> {os.path.basename(meta_json_path)}")
 
         # Sync report
         print("\n  Generating sync report...")
         report = []
-        report.append(f"# Sync Report: {session_name}")
+        report.append(f"# Sync Report: {episode_name}")
         report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        report.append("## Session Overview")
+        report.append("## Episode Overview")
         report.append(f"- Reference camera: Cam {ref_cam}")
         report.append(f"- FPS: {FPS:.4f}")
         report.append(f"- Audio sample rate: {SAMPLE_RATE} Hz")
@@ -617,7 +617,7 @@ def main():
         report.append("| Camera | Source File | Original Duration | Trim Amount | Confidence |")
         report.append("|--------|------------|-------------------|-------------|------------|")
         for cam in range(1, NUM_CAMS + 1):
-            f = session_files[cam]
+            f = episode_files[cam]
             conf = offsets[cam][1]
             label = f["filename"]
             if len(f["paths"]) > 1:
@@ -650,8 +650,8 @@ def main():
         min_conf = min(confidences)
         max_offset_ms = max(abs(offsets[cam][0]) / SAMPLE_RATE * 1000
                             for cam in non_ref)
-        dur_spread = max(session_files[c]["duration"] for c in range(1, NUM_CAMS + 1)) - \
-                     min(session_files[c]["duration"] for c in range(1, NUM_CAMS + 1))
+        dur_spread = max(episode_files[c]["duration"] for c in range(1, NUM_CAMS + 1)) - \
+                     min(episode_files[c]["duration"] for c in range(1, NUM_CAMS + 1))
         checks = [
             ("Cross-correlation confidence > 0.3",
              "PASS" if min_conf > 0.3 else "FAIL", f"min={min_conf:.4f}"),
@@ -660,8 +660,8 @@ def main():
             ("Raw duration spread < 10s",
              "PASS" if dur_spread < 10 else "WARN", f"{dur_spread:.2f}s"),
             ("All cameras present",
-             "PASS" if len(session_files) == NUM_CAMS else "FAIL",
-             f"{len(session_files)}/{NUM_CAMS}"),
+             "PASS" if len(episode_files) == NUM_CAMS else "FAIL",
+             f"{len(episode_files)}/{NUM_CAMS}"),
         ]
         report.append("| Check | Result | Detail |")
         report.append("|-------|--------|--------|")
@@ -671,28 +671,28 @@ def main():
 
         report.append(f"\n## Output Files")
         report.append("```")
-        report.append(f"{session_name}/")
+        report.append(f"{episode_name}/")
         report.append("  synced_raw/        # Frame-synced raw video (stream-copied)")
         for cam in range(1, NUM_CAMS + 1):
             report.append(f"    cam{cam}_synced.mp4")
-        report.append(f"  {session_name}_preview.mp4  # Side-by-side preview (first {PREVIEW_MAX_SEC}s)")
+        report.append(f"  {episode_name}_preview.mp4  # Side-by-side preview (first {PREVIEW_MAX_SEC}s)")
         report.append("  metadata/          # Sync metadata + thumbnails")
-        report.append(f"    {session_name}_metadata.json")
+        report.append(f"    {episode_name}_metadata.json")
         report.append("    cam*_*.THM")
         report.append("```")
 
-        report_path = os.path.join(session_out, f"{session_name}_sync_report.md")
+        report_path = os.path.join(episode_out, f"{episode_name}_sync_report.md")
         with open(report_path, "w") as f:
             f.write("\n".join(report))
         print(f"    -> {os.path.basename(report_path)}")
-        print(f"\n  Done: {session_name}")
+        print(f"\n  Done: {episode_name}")
 
     # ── Final summary ─────────────────────────────────────────────
     print(f"\n{'=' * 70}")
-    print("ALL SESSIONS COMPLETE")
+    print("ALL EPISODES COMPLETE")
     print(f"{'=' * 70}")
     print(f"Output directory: {OUTPUT_BASE}")
-    for sn in sessions:
+    for sn in episodes:
         print(f"  {sn}/")
     print("\nDone!")
 

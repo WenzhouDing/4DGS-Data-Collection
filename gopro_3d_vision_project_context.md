@@ -154,7 +154,7 @@ ffmpeg -ss 0.25 -i camera_02.mp4 -c copy camera_02_synced.mp4
 
 ### Step 5 — Verify sync
 
-Play back synced videos and confirm the clap frame aligns visually across all cameras. Do clap at end of session too to check for drift.
+Play back synced videos and confirm the clap frame aligns visually across all cameras. Do clap at end of episode too to check for drift.
 
 ### Accuracy Notes
 
@@ -195,7 +195,7 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 - ISO locked at 400 for controlled indoor lighting. Adjust both min and max together if scene is too dark/bright
 - 180° shutter = 1/240s at 120fps. For **sharper frames with less motion blur** (better for computer vision feature matching), consider using 90° (1/480s) or 45° (1/960s) shutter angle instead
 - High bit rate → larger files but maximum quality
-- Always do a clap at start AND end of each recording session to verify sync and detect drift
+- Always do a clap at start AND end of each recording episode to verify sync and detect drift
 
 ---
 
@@ -216,11 +216,12 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 
 ## 8. FILES DELIVERED
 
-- `sync_pipeline.py` — Multi-session audio sync pipeline (cross-correlation clap sync, stream-copy trim, N-camera preview grid, chapter merging by `creation_time` + ffmpeg concat demuxer, configurable `--ref-cam`)
+- `sync_pipeline.py` — Multi-episode audio sync pipeline (cross-correlation clap sync, stream-copy trim, N-camera preview grid, chapter merging by `creation_time` + ffmpeg concat demuxer, configurable `--ref-cam`)
 - `run_calibration.py` — Intrinsic + extrinsic calibration from synced checkerboard video (lockstep multi-cam, parallel detection, early stopping, configurable `--ref-cam`, **all-pairs + bridging** through good intermediate cameras for wide-baseline rigs)
 - `run_eval_epipolar.py` — Standalone epipolar-geometry validation (loads calibration JSONs, samples frames, measures point-to-line epipolar distance with outlier rejection)
 - `sync_vis.py` — Local Flask web server + HTML5 `<video>` grid for ±2 frame per-camera offset adjustments after auto-sync. Lazy 720p H.264 proxy generation for fast browser decode; per-video seek queue prevents pile-ups on rapid scrub; clap-peak markers above the timeline; **Apply** button re-trims the synced videos in place using current offsets (reuses `sync_pipeline.ffmpeg_input_args` so chapter-merging works the same way) and resets adjustments to 0 with `previous_offsets` recorded.
-- `viz_calibration.py` — 3D camera-pose viewer (Plotly self-contained HTML). Each camera rendered as a frustum in the reference frame; hover tooltips show K, intrinsic/stereo RMS, baseline, method, and (for bridged cams) the path of intermediates used.
+- `viz_calibration.py` — 3D camera-pose viewer (Plotly self-contained HTML). Each camera rendered as a frustum in the reference frame; hover tooltips show K, intrinsic/stereo RMS, baseline, method, and (for bridged cams) the path of intermediates used. Reads `output/<episode>/calibration/calibration_all_cameras.json`.
+- `organize_episodes.sh` — KITTI-style orchestrator. Runs sync, then per-group calibration (the first index in each `--groups` arg is the calib source), then copies the calibration folder into every episode in the group with a `calibration_source.json` provenance marker. Migrates legacy `session_NN/` folders to `episode_NNNN/` automatically.
 - `pyproject.toml` + `uv.lock` — uv project metadata and locked dependencies (numpy, scipy, opencv-python, matplotlib, flask, plotly); install with `uv sync`
 - `gopro_hero10_3d_rig_config.txt` — The full camera config with QR URLs, all params, per-camera naming URLs, time sync links, and operational notes
 - `gopro_3d_vision_project_context.md` — This file (full context dump for agent handoff)

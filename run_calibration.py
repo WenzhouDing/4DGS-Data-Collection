@@ -12,23 +12,23 @@ detected the board, guaranteeing shared frames for stereo calibration.
 
 Only frames with detected corners are saved to disk (for validation).
 
-Outputs:
-  output/calibration/
+Outputs (per-episode, KITTI-style self-contained):
+  output/<episode>/calibration/
     cam{N}_intrinsics.json       — K, dist, image_size, rms
-    cam{N}_extrinsics.json       — R, T, E, F, stereo_rms (vs --ref-cam)
+    cam{N}_extrinsics.json       — R, T, F, stereo_rms, method, path (vs --ref-cam)
     calibration_all_cameras.json — combined intrinsics + extrinsics
     checkerboard_config.json
     frame_extraction_log.json    — source frame numbers per camera
     validation/
       cam{N}/corners_*.jpg       — corner overlay samples
       cam{N}/reproj_error.png    — per-frame intrinsic error
-      stereo/pair_1_{N}_epipolar_*.jpg
+      stereo/pair_{REF}_{N}_*.jpg
       stereo/stereo_rms.png
       rms_all_cameras.png
 
 Usage:
     python run_calibration.py --board 9x12 --square-size 0.03 \\
-        [--base DIR] [--session SESSION] [--cams N] [--every N]
+        [--base DIR] [--episode EPISODE] [--cams N] [--every N]
 """
 
 import argparse
@@ -50,8 +50,8 @@ def parse_args():
         description="Checkerboard intrinsic + extrinsic calibration")
     p.add_argument("--base", default=".",
                    help="Project root (contains output/ folder)")
-    p.add_argument("--session", default="session_01",
-                   help="Session to calibrate from")
+    p.add_argument("--episode", default="episode_0001",
+                   help="Episode to calibrate from")
     p.add_argument("--cams", type=int, default=12,
                    help="Number of cameras")
     p.add_argument("--ref-cam", type=int, default=1,
@@ -286,7 +286,7 @@ def main():
     args = parse_args()
 
     BASE = os.path.abspath(args.base)
-    SESSION = args.session
+    EPISODE = args.episode
     NUM_CAMS = args.cams
     REF_CAM = args.ref_cam
     SQUARE_SIZE_M = args.square_size
@@ -309,8 +309,10 @@ def main():
         raise SystemExit(1)
     BOARD_SIZE = (board_cols - 1, board_rows - 1)
 
-    SYNCED_DIR = os.path.join(BASE, "output", SESSION, "synced_raw")
-    OUTPUT = os.path.join(BASE, "output", "calibration")
+    SYNCED_DIR = os.path.join(BASE, "output", EPISODE, "synced_raw")
+    # Per-episode calibration folder. Each episode owns its own calibration
+    # so episodes can be shipped as self-contained KITTI-style packages.
+    OUTPUT = os.path.join(BASE, "output", EPISODE, "calibration")
     VALIDATION = os.path.join(OUTPUT, "validation")
     STEREO_VAL = os.path.join(VALIDATION, "stereo")
     os.makedirs(OUTPUT, exist_ok=True)
@@ -321,7 +323,7 @@ def main():
     print("=" * 70)
     print("MULTI-CAMERA CALIBRATION")
     print("=" * 70)
-    print(f"  Session:       {SESSION}")
+    print(f"  Episode:       {EPISODE}")
     print(f"  Cameras:       {NUM_CAMS}")
     print(f"  Reference cam: {REF_CAM} (extrinsics expressed in cam{REF_CAM} frame)")
     print(f"  Board:         {board_cols}x{board_rows} squares "
@@ -868,7 +870,7 @@ def main():
                 "square_size_m": SQUARE_SIZE_M,
                 "board_squares": [board_cols, board_rows],
             },
-            "source_session": SESSION,
+            "source_episode": EPISODE,
             "cameras": cam_data,
         }
         combined_path = os.path.join(OUTPUT, "calibration_all_cameras.json")

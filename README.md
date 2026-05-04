@@ -237,14 +237,21 @@ The `calibration_all_cameras.json` combines both intrinsics and extrinsics for a
 Reads `calibration_all_cameras.json` and renders every camera as a frustum in the reference camera's coordinate frame, with hover tooltips showing K, intrinsic/stereo RMS, baseline, and (for bridged cams) the chain of intermediates used.
 
 ```bash
-uv run python viz_calibration.py --base . [--show]
+# Generate camera_poses.html in EVERY episode's calibration folder
+uv run python viz_calibration.py --base .
+
+# Or render just one episode (and optionally open in a browser)
+uv run python viz_calibration.py --base . --episode episode_0002 --show
 ```
+
+`organize_episodes.sh` invokes the all-episodes form automatically as its final step, so every episode in your output ships with its own `camera_poses.html` next to its calibration JSONs.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `.` | Project root |
-| `--out` | `output/calibration/camera_poses.html` | Output HTML path |
-| `--show` | off | Open in browser after generating |
+| `--episode` | *all* | Only this episode (otherwise loops over every `output/episode_*/` with calibration) |
+| `--out` | `<episode>/calibration/camera_poses.html` | Output HTML path (only with `--episode`) |
+| `--show` | off | Open in browser after generating (only with `--episode`) |
 | `--frustum-depth` | `0.05` | Frustum length in metres (visualization scale only) |
 
 The output is a self-contained HTML file (Plotly with embedded JS — works fully offline). Camera color-coding:

@@ -31,12 +31,16 @@ import plotly.graph_objects as go
 def parse_args():
     p = argparse.ArgumentParser(description="3D camera-pose visualizer")
     p.add_argument("--base", default=".", help="Project root")
-    p.add_argument("--episode", default="episode_0001",
-                   help="Episode whose calibration to visualize")
+    p.add_argument("--episode", default=None,
+                   help="Episode whose calibration to visualize. If omitted, "
+                        "generates camera_poses.html for every episode under "
+                        "output/ that has a calibration_all_cameras.json.")
     p.add_argument("--out", default=None,
-                   help="Output HTML path (default: <episode>/calibration/camera_poses.html)")
+                   help="Output HTML path (only meaningful with --episode; "
+                        "in all-episodes mode the file is always written into "
+                        "<episode>/calibration/camera_poses.html)")
     p.add_argument("--show", action="store_true",
-                   help="Open in browser after generating")
+                   help="Open in browser after generating (only with --episode)")
     p.add_argument("--frustum-depth", type=float, default=0.05,
                    help="Frustum depth in metres (visualization scale)")
     return p.parse_args()
@@ -206,22 +210,19 @@ def add_legend_dummies(traces):
         ))
 
 
-# ─── MAIN ─────────────────────────────────────────────────────────
-def main():
-    args = parse_args()
-    base = os.path.abspath(args.base)
-    episode = args.episode
+def render_episode(base, episode, frustum_depth, out_path=None, verbose=True):
+    """Generate camera_poses.html for one episode. Returns the output path,
+    or None if the episode has no calibration_all_cameras.json."""
     calib_path = os.path.join(base, "output", episode, "calibration",
                               "calibration_all_cameras.json")
     if not os.path.exists(calib_path):
-        print(f"ERROR: {calib_path} not found.")
-        print(f"  Run run_calibration.py --episode {episode} first.")
-        raise SystemExit(1)
+        if verbose:
+            print(f"  {episode}: no calibration_all_cameras.json (skip)")
+        return None
 
     with open(calib_path) as f:
         calib = json.load(f)
 
-    # Load per-cam data
     camera_data = {}
     ref_cam = None
     for cam_key, cam_meta in calib.get("cameras", {}).items():
@@ -253,12 +254,10 @@ def main():
         camera_data[cam_id] = cd
 
     if ref_cam is None:
-        # No extrinsics anywhere — fall back to cam1
         ref_cam = min(camera_data.keys()) if camera_data else 1
 
-    # Build figure
-    traces, centers = build_traces(camera_data, ref_cam, args.frustum_depth)
-    add_axes_at_origin(traces, length=args.frustum_depth * 1.5)
+    traces, centers = build_traces(camera_data, ref_cam, frustum_depth)
+    add_axes_at_origin(traces, length=frustum_depth * 1.5)
     add_legend_dummies(traces)
 
     n_total = len(camera_data)
@@ -268,7 +267,7 @@ def main():
     fig = go.Figure(data=traces)
     fig.update_layout(
         title=dict(
-            text=(f"Camera Poses — {n_with_pose}/{n_total} cams placed,"
+            text=(f"Camera Poses — {episode} — {n_with_pose}/{n_total} cams,"
                   f" reference = cam{ref_cam}"),
             font=dict(size=14, color="#e6edf3"),
         ),
@@ -295,24 +294,59 @@ def main():
         ),
     )
 
-    out_path = args.out or os.path.join(
-        base, "output", episode, "calibration", "camera_poses.html")
+    if out_path is None:
+        out_path = os.path.join(base, "output", episode,
+                                "calibration", "camera_poses.html")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    # Embed plotly.js so the file works fully offline
     fig.write_html(out_path, include_plotlyjs=True)
-    print(f"Wrote {out_path}")
-    print(f"  {n_with_pose}/{n_total} cameras placed (ref = cam{ref_cam})")
+    if verbose:
+        print(f"  {episode} -> {out_path}  ({n_with_pose}/{n_total} cams, ref=cam{ref_cam})")
+    return out_path
 
-    # Print a small text summary of what's placed where
-    print("\n  Camera positions (x, y, z) in metres, ref frame:")
-    for cam_id, center in sorted(centers, key=lambda x: x[0]):
-        cd = camera_data[cam_id]
-        method = cd.get("method", "—") if cam_id != ref_cam else "reference"
-        print(f"    cam{cam_id:>2}: ({center[0]:+.4f}, {center[1]:+.4f}, "
-              f"{center[2]:+.4f})  [{method}]")
 
-    if args.show:
-        webbrowser.open(f"file://{out_path}")
+def discover_episodes(base):
+    """List sorted episode_NNNN directory names under output/."""
+    import glob as _glob
+    out_dir = os.path.join(base, "output")
+    if not os.path.isdir(out_dir):
+        return []
+    eps = []
+    for path in _glob.glob(os.path.join(out_dir, "episode_*")):
+        if os.path.isdir(path):
+            eps.append(os.path.basename(path))
+    return sorted(eps)
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────
+def main():
+    args = parse_args()
+    base = os.path.abspath(args.base)
+
+    if args.episode is not None:
+        # Single episode: behave as before, with --out / --show honored.
+        out_path = render_episode(
+            base, args.episode, args.frustum_depth, out_path=args.out)
+        if out_path is None:
+            print(f"ERROR: no calibration in output/{args.episode}/calibration/.")
+            print(f"  Run run_calibration.py --episode {args.episode} first.")
+            raise SystemExit(1)
+        if args.show:
+            webbrowser.open(f"file://{out_path}")
+        return
+
+    # All-episodes mode: write camera_poses.html into every episode's
+    # calibration/ folder. --out and --show are ignored (would need a
+    # per-episode value); use --episode to render a single one.
+    episodes = discover_episodes(base)
+    if not episodes:
+        print(f"ERROR: no episode_*/ directories under {base}/output/")
+        raise SystemExit(1)
+    print(f"Generating camera_poses.html for {len(episodes)} episode(s):")
+    rendered = 0
+    for ep in episodes:
+        if render_episode(base, ep, args.frustum_depth) is not None:
+            rendered += 1
+    print(f"Done — {rendered}/{len(episodes)} rendered.")
 
 
 if __name__ == "__main__":

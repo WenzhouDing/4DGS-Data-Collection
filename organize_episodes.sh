@@ -211,7 +211,14 @@ JSON
     echo
 done
 
-# ─── Step 6: Final summary ───────────────────────────────────────
+# ─── Step 6: Generate 3D camera-pose HTML in each episode ───────
+echo "════════════════════════════════════════════════════════════"
+echo "STEP 6: Render 3D camera-pose HTML for each episode"
+echo "════════════════════════════════════════════════════════════"
+OPENCV_OPENCL_DEVICE=disabled uv run python viz_calibration.py --base "$BASE"
+echo
+
+# ─── Step 7: Final summary ───────────────────────────────────────
 echo "════════════════════════════════════════════════════════════"
 echo "DONE — episode layout:"
 echo "════════════════════════════════════════════════════════════"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # organize_episodes.sh — KITTI-style per-episode organization
 # ============================================================
-# Runs sync_pipeline.py + run_calibration.py end-to-end and arranges
+# Runs synchronization, calibration, and undistorted video export and arranges
 # output/ as a set of self-contained episode_NNNN folders, each with its
 # own calibration/ folder. Episodes within the same --groups arg share
 # calibration: the first index in each group is the calibration source,
@@ -31,6 +31,7 @@ MAX_FRAMES=0
 GROUP_LIST=()
 SKIP_SYNC=0
 SKIP_CALIB=0
+SKIP_EXPORT=0
 
 # ─── Arg parsing ─────────────────────────────────────────────────
 print_help() {
@@ -49,7 +50,8 @@ Optional:
   --ref-cam N          Reference camera (default: 1)
   --max-frames N       run_calibration --max-frames (default: 0 = no cap)
   --skip-sync          Don't re-run sync_pipeline (assume episodes exist)
-  --skip-calib         Don't run calibration; only copy existing calib folders
+  --skip-calib         Reuse validated existing calibration; fail if invalid/missing
+  --skip-export        Skip undistorted video export (calibration-only workflow)
 
 Example:
   $0 --base . --cams 12 --board 9x12 --square-size 0.03 \\
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --max-frames)   MAX_FRAMES="$2"; shift 2 ;;
         --skip-sync)    SKIP_SYNC=1; shift ;;
         --skip-calib)   SKIP_CALIB=1; shift ;;
+        --skip-export)  SKIP_EXPORT=1; shift ;;
         --groups)
             shift
             while [[ $# -gt 0 && "$1" != --* ]]; do
@@ -148,8 +151,15 @@ for group in "${GROUP_LIST[@]}"; do
     done
 done
 missing=0
+selected_episodes=()
 for idx in "${all_indices[@]}"; do
     ep=$(episode_name "$idx")
+    already_selected=0
+    for selected in "${selected_episodes[@]:-}"; do
+        [[ "$selected" == "$ep" ]] && { already_selected=1; break; }
+    done
+    [[ $already_selected -eq 1 ]] && continue
+    selected_episodes+=("$ep")
     if [[ ! -d "$OUTPUT_DIR/$ep" ]]; then
         echo "  ERROR: $OUTPUT_DIR/$ep not found"
         missing=$((missing + 1))
@@ -175,60 +185,76 @@ for group in "${GROUP_LIST[@]}"; do
 
     echo "── Group [${parts[*]}] — calibration source: $src_ep ──"
 
+    reusable=0
     if [[ -f "$src_calib/calibration_all_cameras.json" ]]; then
-        echo "  $src_ep: calibration already present ($src_calib)"
-    elif [[ $SKIP_CALIB -eq 1 ]]; then
-        echo "  [skip-calib] expected $src_calib/calibration_all_cameras.json but not found" >&2
-        exit 1
-    else
+        if uv run python calibration_validation.py --calibration-dir "$src_calib" \
+                --cams "$CAMS" --ref-cam "$REF_CAM"; then
+            reusable=1
+            echo "  $src_ep: existing calibration passed reuse checks"
+        fi
+    fi
+    if [[ $reusable -eq 0 ]]; then
+        if [[ $SKIP_CALIB -eq 1 ]]; then
+            echo "  [skip-calib] calibration is missing or failed reuse checks; nothing copied" >&2
+            exit 1
+        fi
         echo "  Running calibration on $src_ep..."
         OPENCV_OPENCL_DEVICE=disabled uv run python run_calibration.py \
             --base "$BASE" --cams "$CAMS" --episode "$src_ep" \
             --ref-cam "$REF_CAM" --board "$BOARD" --square-size "$SQUARE" \
             --max-frames "$MAX_FRAMES"
+        uv run python calibration_validation.py --calibration-dir "$src_calib" \
+            --cams "$CAMS" --ref-cam "$REF_CAM"
     fi
 
     # ─── Step 5: Copy calibration to other episodes in the group ──
     for idx in "${parts[@]:1}"; do
         ep=$(episode_name "$idx")
         target="$OUTPUT_DIR/$ep/calibration"
-        if [[ -d "$target" ]]; then
-            echo "  $ep/calibration: already present, replacing"
-            rm -rf "$target"
-        fi
-        cp -R "$src_calib" "$target"
-        # Mark provenance so the destination knows the calib didn't come
-        # from its own checkerboard footage.
-        cat > "$target/calibration_source.json" <<JSON
-{
-  "source_episode": "$src_ep",
-  "copied_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "note": "Calibration captured during ${src_ep}; reused here because this episode shares the same physical rig configuration."
-}
-JSON
+        uv run python calibration_validation.py --calibration-dir "$src_calib" \
+            --cams "$CAMS" --ref-cam "$REF_CAM" --copy-to "$target" \
+            --source-episode "$src_ep"
         echo "  $ep: copied calibration from $src_ep"
     done
     echo
 done
 
-# ─── Step 6: Generate 3D camera-pose HTML in each episode ───────
+# ─── Step 6: Export synchronized, undistorted video ─────────────
+if [[ $SKIP_EXPORT -eq 0 ]]; then
+    echo "════════════════════════════════════════════════════════════"
+    echo "STEP 6: Export synchronized, undistorted video for selected episodes"
+    echo "════════════════════════════════════════════════════════════"
+    for ep in "${selected_episodes[@]}"; do
+        OPENCV_OPENCL_DEVICE=disabled uv run python export_calibrated_videos.py \
+            --base "$BASE" --episode "$ep" --cams "$CAMS"
+        OPENCV_OPENCL_DEVICE=disabled uv run python make_undistorted_preview.py \
+            --base "$BASE" --episode "$ep"
+    done
+    echo
+else
+    echo "[skip-export] Skipping undistorted video export"
+fi
+
+# ─── Step 7: Generate 3D camera-pose HTML in each episode ───────
 echo "════════════════════════════════════════════════════════════"
-echo "STEP 6: Render 3D camera-pose HTML for each episode"
+echo "STEP 7: Render 3D camera-pose HTML for each episode"
 echo "════════════════════════════════════════════════════════════"
 OPENCV_OPENCL_DEVICE=disabled uv run python viz_calibration.py --base "$BASE"
 echo
 
-# ─── Step 7: Final summary ───────────────────────────────────────
+# ─── Step 8: Final summary ───────────────────────────────────────
 echo "════════════════════════════════════════════════════════════"
 echo "DONE — episode layout:"
 echo "════════════════════════════════════════════════════════════"
-for d in "$OUTPUT_DIR"/episode_*; do
-    [[ -d "$d" ]] || continue
-    ep=$(basename "$d")
+for ep in "${selected_episodes[@]}"; do
+    d="$OUTPUT_DIR/$ep"
     has_synced=$([[ -d "$d/synced_raw" ]] && echo "synced_raw/✓" || echo "synced_raw/✗")
     has_calib=$([[ -f "$d/calibration/calibration_all_cameras.json" ]] && echo "calibration/✓" || echo "calibration/✗")
+    has_undistorted=$([[ -d "$d/synced_undistorted" ]] && echo "synced_undistorted/✓" || echo "synced_undistorted/✗")
+    has_output_calib=$([[ -f "$d/calibration_undistorted/calibration_all_cameras.json" ]] && echo "calibration_undistorted/✓" || echo "calibration_undistorted/✗")
+    has_preview=$([[ -f "$d/${ep}_undistorted_preview.mp4" ]] && echo "undistorted_preview/✓" || echo "undistorted_preview/✗")
     src=""
     [[ -f "$d/calibration/calibration_source.json" ]] && \
         src=" (calib from $(uv run python -c "import json; print(json.load(open('$d/calibration/calibration_source.json'))['source_episode'])" 2>/dev/null))"
-    echo "  $ep — $has_synced  $has_calib$src"
+    echo "  $ep — $has_synced  $has_calib  $has_undistorted  $has_output_calib  $has_preview$src"
 done

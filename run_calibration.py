@@ -42,6 +42,15 @@ import tempfile
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from calibration_geometry import (
+    EXTRINSICS_CONVENTION, fundamental_from_KRT, reprojection_rms,
+    undistort_points_checked,
+)
+from calibration_fit import fit_intrinsics
+from calibration_observations import load_corner_cache, save_corner_cache, split_observations
+from calibration_frame_offsets import load_frame_offsets
 
 
 # ─── CLI ──────────────────────────────────────────────────────────
@@ -67,6 +76,9 @@ def parse_args():
     p.add_argument("--max-frames", type=int, default=60,
                    help="Stop after this many frames with ALL cameras detecting "
                         "the board (default 60). 0 = no limit.")
+    p.add_argument("--corners-cache", help="Load/save source-checked checkerboard detections (.npz)")
+    p.add_argument("--output-dir", help="Calibration output directory (default: episode/calibration)")
+    p.add_argument("--frame-offsets", help="JSON camera offsets: source frame = logical frame + offset")
     return p.parse_args()
 
 
@@ -96,16 +108,102 @@ def invert_transform(R, T):
     return R.T, -R.T @ T
 
 
-def fundamental_from_KRT(K1, K2, R, T):
-    """Compute F (p2.T @ F @ p1 = 0 in pixel coords) from intrinsics + extrinsics.
+def lookup_pair(all_pairs, i, j):
+    """Return every directional quantity consistently, including F for reversed pairs."""
+    info = all_pairs.get((min(i, j), max(i, j)))
+    if info is None:
+        return None
+    if i < j:
+        return info["R"], info["T"], info
+    R, T = invert_transform(info["R"], info["T"])
+    reversed_info = dict(info, R=R, T=T, F=info["F"].T)
+    return R, T, reversed_info
 
-    R, T must be the cam1→cam2 transform.
-    """
-    Tx = np.array([[0, -T[2, 0], T[1, 0]],
-                   [T[2, 0], 0, -T[0, 0]],
-                   [-T[1, 0], T[0, 0], 0]])
-    E = Tx @ R
-    return np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+
+def read_validation_image(path, synced_dir, cam, filename, frame_offset=0):
+    if path is not None:
+        image = cv2.imread(path)
+    else:
+        source_frame = int(filename[6:-4]) + frame_offset
+        if source_frame < 0:
+            raise ValueError("Frame offset requests a negative source frame")
+        cap = cv2.VideoCapture(os.path.join(synced_dir, f"cam{cam}_synced.mp4"))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+        ok, image = cap.read()
+        cap.release()
+        if not ok:
+            image = None
+    if image is None:
+        raise ValueError(f"Cannot load cam{cam} validation frame {filename}")
+    return image
+
+
+def evaluate_heldout(intrinsics, extrinsics, observations, reference):
+    """Evaluate untouched checkerboard observations; retain all finite errors."""
+    results = {}
+    for cam in sorted(intrinsics):
+        if cam == reference:
+            continue
+        entry = {"frames": [], "status": "INCOMPLETE", "invalid_points": 0}
+        results[f"{reference}-{cam}"] = entry
+        if cam not in extrinsics:
+            entry["reason"] = "No extrinsics"
+            continue
+        shared = sorted(set(observations[reference]) & set(observations[cam]))
+        F = np.array(extrinsics[cam]["F"])
+        all_distances = []
+        for name in shared:
+            p1, valid1 = undistort_points_checked(observations[reference][name][0],
+                                                 intrinsics[reference]["K"], intrinsics[reference]["dist"])
+            p2, valid2 = undistort_points_checked(observations[cam][name][0],
+                                                 intrinsics[cam]["K"], intrinsics[cam]["dist"])
+            valid = valid1 & valid2
+            entry["invalid_points"] += int(np.sum(~valid))
+            a = np.column_stack((p1[valid], np.ones(valid.sum())))
+            b = np.column_stack((p2[valid], np.ones(valid.sum())))
+            l2, l1 = a @ F.T, b @ F
+            denominator1 = np.linalg.norm(l1[:, :2], axis=1)
+            denominator2 = np.linalg.norm(l2[:, :2], axis=1)
+            safe = (denominator1 > 1e-12) & (denominator2 > 1e-12)
+            entry["invalid_points"] += int(np.sum(~safe))
+            residual = np.abs(np.sum(b * l2, axis=1))[safe]
+            distances = np.concatenate((residual/denominator1[safe], residual/denominator2[safe]))
+            if len(distances):
+                all_distances.extend(distances.tolist())
+                entry["frames"].append({"source_frame": int(name[6:-4]),
+                                        "mean_px": float(np.mean(distances)),
+                                        "max_px": float(np.max(distances))})
+        entry["shared_frames"] = len(shared)
+        if all_distances:
+            entry.update(mean_px=float(np.mean(all_distances)),
+                         median_px=float(np.median(all_distances)),
+                         p95_px=float(np.percentile(all_distances, 95)),
+                         max_px=float(np.max(all_distances)))
+            if len(entry["frames"]) >= 3:
+                entry["status"] = ("PASS" if entry["mean_px"] < 2 and entry["p95_px"] < 5
+                                   and not entry["invalid_points"] else "FAIL")
+    return {"passed": bool(results) and all(p["status"] == "PASS" for p in results.values()),
+            "reference": f"cam{reference}", "pairs": results,
+            "thresholds": {"min_frames": 3, "mean_px_lt": 2, "p95_px_lt": 5},
+            "notes": "Frames excluded from both intrinsic and stereo fitting; no residual rejection."}
+
+
+def publish_calibration(staging, target):
+    """Keep the previous calibration intact until a complete replacement is ready."""
+    staging, target = Path(staging), Path(target)
+    backup = None
+    if target.exists():
+        if any(target.iterdir()) and not (target / "calibration_all_cameras.json").is_file():
+            raise ValueError(f"Refusing to replace a non-calibration directory: {target}")
+        backup = target.with_name(target.name + f".backup-{time.time_ns()}")
+        target.rename(backup)
+    try:
+        staging.rename(target)
+    except BaseException:
+        if backup is not None:
+            backup.rename(target)
+        raise
+    return str(backup) if backup is not None else None
 
 
 def find_bridging_path(ref, target, edges, num_cams, max_hops=MAX_BRIDGE_HOPS):
@@ -229,13 +327,13 @@ def make_error_bar_chart(per_frame_errors, cam_label, output_path):
 
     fig, ax = plt.subplots(figsize=(max(6, len(per_frame_errors) * 0.18), 4))
     x = np.arange(len(per_frame_errors))
-    colors = ["#e74c3c" if e > 0.1 else "#f39c12" if e > 0.06 else "#2ecc71"
+    colors = ["#e74c3c" if e > 1.0 else "#f39c12" if e > 0.5 else "#2ecc71"
               for e in per_frame_errors]
     ax.bar(x, per_frame_errors, color=colors, width=0.8)
     ax.axhline(np.mean(per_frame_errors), color="#3498db", linestyle="--",
                linewidth=1.5, label=f"mean = {np.mean(per_frame_errors):.4f} px")
     ax.set_xlabel("Frame index")
-    ax.set_ylabel("Reprojection error (px)")
+    ax.set_ylabel("Per-corner RMS reprojection error (px)")
     ax.set_title(f"{cam_label} — Per-Frame Reprojection Error")
     ax.legend()
     ax.set_xlim(-0.5, len(per_frame_errors) - 0.5)
@@ -292,6 +390,8 @@ def main():
     SQUARE_SIZE_M = args.square_size
     EVERY_N = args.every
     MAX_FRAMES = args.max_frames
+    FRAME_OFFSETS = load_frame_offsets(getattr(args, "frame_offsets", None), NUM_CAMS)
+    offsets_json = {f"cam{cam}": value for cam, value in FRAME_OFFSETS.items()}
 
     if not (1 <= REF_CAM <= NUM_CAMS):
         print(f"ERROR: --ref-cam {REF_CAM} must be in 1..{NUM_CAMS}")
@@ -308,11 +408,17 @@ def main():
         print(f"ERROR: --board values must be integers, got '{args.board}'")
         raise SystemExit(1)
     BOARD_SIZE = (board_cols - 1, board_rows - 1)
+    if (min(BOARD_SIZE) < 2 or not np.isfinite(SQUARE_SIZE_M) or SQUARE_SIZE_M <= 0
+            or EVERY_N < 1 or MAX_FRAMES < 0):
+        raise ValueError("Use at least 3 board squares per dimension, positive square size/every, and nonnegative max-frames")
 
     SYNCED_DIR = os.path.join(BASE, "output", EPISODE, "synced_raw")
     # Per-episode calibration folder. Each episode owns its own calibration
     # so episodes can be shipped as self-contained KITTI-style packages.
-    OUTPUT = os.path.join(BASE, "output", EPISODE, "calibration")
+    TARGET_OUTPUT = os.path.abspath(args.output_dir or os.path.join(BASE, "output", EPISODE, "calibration"))
+    os.makedirs(os.path.dirname(TARGET_OUTPUT), exist_ok=True)
+    OUTPUT = tempfile.mkdtemp(prefix=".calibration-staging-", dir=os.path.dirname(TARGET_OUTPUT))
+    published = False
     VALIDATION = os.path.join(OUTPUT, "validation")
     STEREO_VAL = os.path.join(VALIDATION, "stereo")
     os.makedirs(OUTPUT, exist_ok=True)
@@ -326,6 +432,7 @@ def main():
     print(f"  Episode:       {EPISODE}")
     print(f"  Cameras:       {NUM_CAMS}")
     print(f"  Reference cam: {REF_CAM} (extrinsics expressed in cam{REF_CAM} frame)")
+    print(f"  Frame offsets: {offsets_json} (source = logical + offset)")
     print(f"  Board:         {board_cols}x{board_rows} squares "
           f"-> {BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners")
     print(f"  Square size:   {SQUARE_SIZE_M*1000:.1f} mm")
@@ -353,156 +460,189 @@ def main():
         # Only frames with detected corners are saved to disk.
         step_header(1, f"Detecting corners ({BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner)")
 
-        # Open all video captures
-        caps = {}
-        cam_tmp_dirs = {}
-        for cam in range(1, NUM_CAMS + 1):
-            vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
-            if not os.path.exists(vid):
-                print(f"  WARNING: {vid} not found, skipping")
-                continue
-            cap = cv2.VideoCapture(vid)
-            if cap.get(cv2.CAP_PROP_FPS) <= 0:
-                print(f"  WARNING: cannot read {vid}, skipping")
-                cap.release()
-                continue
-            caps[cam] = cap
-            cam_tmp_dirs[cam] = os.path.join(tmpdir, f"cam{cam}")
-            os.makedirs(cam_tmp_dirs[cam], exist_ok=True)
+        if args.corners_cache and os.path.exists(args.corners_cache):
+            cam_corners, img_shape, cam_scan_info = load_corner_cache(
+                args.corners_cache, SYNCED_DIR, BOARD_SIZE, NUM_CAMS, FRAME_OFFSETS)
+            print(f"  Loaded checked detections from {args.corners_cache}")
+        else:
+            # Open all video captures
+            caps = {}
+            cam_tmp_dirs = {}
+            for cam in range(1, NUM_CAMS + 1):
+                vid = os.path.join(SYNCED_DIR, f"cam{cam}_synced.mp4")
+                if not os.path.exists(vid):
+                    raise ValueError(f"Required camera video is missing: {vid}")
+                cap = cv2.VideoCapture(vid)
+                if cap.get(cv2.CAP_PROP_FPS) <= 0:
+                    cap.release()
+                    raise ValueError(f"Cannot read required video: {vid}")
+                caps[cam] = cap
+                cam_tmp_dirs[cam] = os.path.join(tmpdir, f"cam{cam}")
+                os.makedirs(cam_tmp_dirs[cam], exist_ok=True)
 
-        if not caps:
-            print("\nERROR: No valid video files found!")
-            raise SystemExit(1)
+            if not caps:
+                print("\nERROR: No valid video files found!")
+                raise SystemExit(1)
 
-        source_fps = list(caps.values())[0].get(cv2.CAP_PROP_FPS)
-        total_frames = int(list(caps.values())[0].get(cv2.CAP_PROP_FRAME_COUNT))
+            source_fps = list(caps.values())[0].get(cv2.CAP_PROP_FPS)
+            frame_counts = {cam: int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) for cam, cap in caps.items()}
+            first_frame = max(0, -min(FRAME_OFFSETS.values()))
+            total_frames = min(frame_counts[cam] - FRAME_OFFSETS[cam] for cam in caps)
+            if first_frame >= total_frames:
+                raise ValueError("Frame offsets leave no common video frames")
+            for cam, cap in caps.items():
+                if not np.isclose(cap.get(cv2.CAP_PROP_FPS), source_fps, rtol=1e-5):
+                    raise ValueError("Camera FPS differ; constant frame offsets cannot align these videos")
+                source_start = first_frame + FRAME_OFFSETS[cam]
+                if source_start and not cap.set(cv2.CAP_PROP_POS_FRAMES, source_start):
+                    raise ValueError(f"Cannot seek cam{cam} to alignment start {source_start}")
 
-        cam_corners = {cam: {} for cam in range(1, NUM_CAMS + 1)}
-        cam_detected_frames = {cam: [] for cam in caps}
-        img_shape = None
-        shared_count = 0
-        scanned = 0
-        t0 = time.time()
-        last_progress = t0
+            cam_corners = {cam: {} for cam in range(1, NUM_CAMS + 1)}
+            cam_detected_frames = {cam: [] for cam in caps}
+            img_shape = None
+            shared_count = 0
+            scanned = 0
+            t0 = time.time()
+            last_progress = t0
 
-        # Process all cameras in lockstep — same frame number, parallel detection.
-        # If any camera can't grab a frame, lockstep is broken — stop rather
-        # than silently skip, since mismatched frame indices would corrupt
-        # stereo correspondences.
-        with ThreadPoolExecutor(max_workers=len(caps)) as pool:
-            frame_num = 0
-            failed_cam = None
-            while frame_num < total_frames:
-                # Advance all captures together
-                all_ok = True
-                for cam in caps:
-                    if not caps[cam].grab():
-                        failed_cam = cam
-                        all_ok = False
-                        break
-                if not all_ok:
-                    print(f"\n  Cam {failed_cam}: grab() failed at frame "
-                          f"{frame_num}/{total_frames} — stopping detection "
-                          f"(this is normal at end-of-stream).")
-                    break
-
-                if frame_num % EVERY_N == 0:
-                    scanned += 1
-
-                    # Retrieve frames from all cameras
-                    imgs = {}
-                    grays = {}
+            # Process all cameras in lockstep — same frame number, parallel detection.
+            # If any camera can't grab a frame, lockstep is broken — stop rather
+            # than silently skip, since mismatched frame indices would corrupt
+            # stereo correspondences.
+            with ThreadPoolExecutor(max_workers=len(caps)) as pool:
+                frame_num = first_frame
+                failed_cam = None
+                while frame_num < total_frames:
+                    # Advance all captures together
+                    all_ok = True
                     for cam in caps:
-                        ret, img = caps[cam].retrieve()
-                        if ret:
-                            imgs[cam] = img
-                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                            grays[cam] = gray
-                            if img_shape is None:
-                                img_shape = gray.shape[::-1]
-
-                    # Detect corners across all cameras in parallel
-                    futures = {
-                        pool.submit(_detect_frame, grays[cam], BOARD_SIZE): cam
-                        for cam in grays
-                    }
-                    results = {}
-                    for fut in as_completed(futures):
-                        results[futures[fut]] = fut.result()
-
-                    # Record detections
-                    fname = f"frame_{frame_num:06d}.jpg"
-                    frame_detected = []
-                    for cam, corners in results.items():
-                        if corners is not None:
-                            fpath = os.path.join(cam_tmp_dirs[cam], fname)
-                            cv2.imwrite(fpath, imgs[cam],
-                                        [cv2.IMWRITE_JPEG_QUALITY, 95])
-                            cam_corners[cam][fname] = (corners, fpath)
-                            cam_detected_frames[cam].append(frame_num)
-                            frame_detected.append(cam)
-
-                    if len(frame_detected) == len(caps):
-                        shared_count += 1
-
-                    # Progress (every 0.5s)
-                    now = time.time()
-                    if now - last_progress >= 0.5:
-                        last_progress = now
-                        el = now - t0
-                        fps_p = scanned / el if el > 0 else 0
-                        pct = 100 * frame_num / total_frames
-                        eta = ((total_frames - frame_num)
-                               / (frame_num / el)
-                               if frame_num > 0 and el > 0 else 0)
-                        det_counts = [len(cam_corners[c])
-                                      for c in sorted(caps.keys())]
-                        progress(
-                            f"\r  {pct:.0f}%  "
-                            f"shared: {shared_count}"
-                            f"{'/' + str(MAX_FRAMES) if MAX_FRAMES > 0 else ''}  "
-                            f"per-cam: {det_counts}  "
-                            f"[{fps_p:.0f} fps, ETA {fmt_time(eta)}]"
-                            f"          ",
-                            end="")
-
-                    # Early stopping — enough shared detections
-                    if MAX_FRAMES > 0 and shared_count >= MAX_FRAMES:
+                        if not caps[cam].grab():
+                            failed_cam = cam
+                            all_ok = False
+                            break
+                    if not all_ok:
+                        print(f"\n  Cam {failed_cam}: grab() failed at frame "
+                              f"{frame_num}/{total_frames} — stopping detection "
+                              f"(this is normal at end-of-stream).")
                         break
 
-                frame_num += 1
+                    if frame_num % EVERY_N == 0:
+                        scanned += 1
 
-        for cam in caps:
-            caps[cam].release()
-        elapsed = time.time() - t0
+                        # Retrieve frames from all cameras
+                        imgs = {}
+                        grays = {}
+                        for cam in caps:
+                            ret, img = caps[cam].retrieve()
+                            if ret:
+                                imgs[cam] = img
+                                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                                grays[cam] = gray
+                                if img_shape is None:
+                                    img_shape = gray.shape[::-1]
+                                elif img_shape != gray.shape[::-1]:
+                                    raise ValueError(f"cam{cam} video dimensions differ from the other cameras")
 
-        progress(
-            f"\r  Done — {shared_count} shared detections, "
-            f"{scanned} frames scanned  [{fmt_time(elapsed)}]"
-            f"                              \n", end="")
+                        # Detect corners across all cameras in parallel
+                        futures = {
+                            pool.submit(_detect_frame, grays[cam], BOARD_SIZE): cam
+                            for cam in grays
+                        }
+                        results = {}
+                        for fut in as_completed(futures):
+                            results[futures[fut]] = fut.result()
 
-        if img_shape is None:
-            print("\nERROR: No frames could be read from any camera!")
-            raise SystemExit(1)
+                        # Record detections
+                        fname = f"frame_{frame_num:06d}.jpg"
+                        frame_detected = []
+                        for cam, corners in results.items():
+                            if corners is not None:
+                                fpath = os.path.join(cam_tmp_dirs[cam], fname)
+                                cv2.imwrite(fpath, imgs[cam],
+                                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                                cam_corners[cam][fname] = (corners, fpath)
+                                cam_detected_frames[cam].append(frame_num)
+                                frame_detected.append(cam)
 
-        # Build scan info for extraction log
-        cam_scan_info = {}
-        for cam in range(1, NUM_CAMS + 1):
-            cam_scan_info[cam] = {
-                "source_fps": source_fps if cam in caps else 0,
-                "total_frames": total_frames if cam in caps else 0,
-                "every_n": EVERY_N,
-                "scanned": scanned if cam in caps else 0,
-                "detected": len(cam_corners[cam]),
-                "frame_numbers": cam_detected_frames.get(cam, []),
-                "elapsed_sec": round(elapsed, 1),
-            }
+                        if len(frame_detected) == len(caps):
+                            shared_count += 1
 
-        # Detection summary
-        print()
-        total_det = sum(len(cam_corners[c]) for c in range(1, NUM_CAMS + 1))
-        print(f"  Total: {total_det} detections across {NUM_CAMS} cameras "
-              f"({scanned} frames scanned, {shared_count} shared)")
+                        # Progress (every 0.5s)
+                        now = time.time()
+                        if now - last_progress >= 0.5:
+                            last_progress = now
+                            el = now - t0
+                            fps_p = scanned / el if el > 0 else 0
+                            pct = 100 * frame_num / total_frames
+                            eta = ((total_frames - frame_num)
+                                   / (frame_num / el)
+                                   if frame_num > 0 and el > 0 else 0)
+                            det_counts = [len(cam_corners[c])
+                                          for c in sorted(caps.keys())]
+                            progress(
+                                f"\r  {pct:.0f}%  "
+                                f"shared: {shared_count}"
+                                f"{'/' + str(MAX_FRAMES) if MAX_FRAMES > 0 else ''}  "
+                                f"per-cam: {det_counts}  "
+                                f"[{fps_p:.0f} fps, ETA {fmt_time(eta)}]"
+                                f"          ",
+                                end="")
+
+                        # Early stopping — enough shared detections
+                        if MAX_FRAMES > 0 and shared_count >= MAX_FRAMES:
+                            break
+
+                    frame_num += 1
+
+            for cam in caps:
+                caps[cam].release()
+            elapsed = time.time() - t0
+
+            progress(
+                f"\r  Done — {shared_count} shared detections, "
+                f"{scanned} frames scanned  [{fmt_time(elapsed)}]"
+                f"                              \n", end="")
+
+            if img_shape is None:
+                print("\nERROR: No frames could be read from any camera!")
+                raise SystemExit(1)
+
+            # Build scan info for extraction log
+            cam_scan_info = {}
+            for cam in range(1, NUM_CAMS + 1):
+                cam_scan_info[cam] = {
+                    "source_fps": source_fps if cam in caps else 0,
+                    "total_frames": frame_counts.get(cam, 0),
+                    "frame_offset": FRAME_OFFSETS[cam],
+                    "every_n": EVERY_N,
+                    "scanned": scanned if cam in caps else 0,
+                    "detected": len(cam_corners[cam]),
+                    "frame_numbers": cam_detected_frames.get(cam, []),
+                    "elapsed_sec": round(elapsed, 1),
+                }
+
+            # Detection summary
+            print()
+            total_det = sum(len(cam_corners[c]) for c in range(1, NUM_CAMS + 1))
+            print(f"  Total: {total_det} detections across {NUM_CAMS} cameras "
+                  f"({scanned} frames scanned, {shared_count} shared)")
+
+            if args.corners_cache:
+                save_corner_cache(args.corners_cache, cam_corners, img_shape,
+                                  BOARD_SIZE, cam_scan_info, SYNCED_DIR, FRAME_OFFSETS)
+
+        # Globally reserve test observations before selecting any camera's model.
+        # A second split supplies model-selection validation (about 64/16/20%).
+        training_pool, test_observations, test_names = split_observations(cam_corners)
+        cam_corners, selection_observations, selection_names = split_observations(training_pool)
+        split_info = {
+            "training": sorted(set().union(*(set(v) for v in cam_corners.values()))),
+            "model_selection": selection_names, "test": test_names,
+            "source_frame_offsets": offsets_json,
+            "notes": "Test frames never used by intrinsic fitting, model selection, or stereo fitting.",
+        }
+        with open(os.path.join(OUTPUT, "observation_split.json"), "w") as f:
+            json.dump(split_info, f, indent=2)
 
         # ══════════════════════════════════════════════════════════
         # STEP 2: INTRINSIC CALIBRATION
@@ -529,10 +669,19 @@ def main():
             img_pts = [corners_dict[fn][0] for fn in frame_names]
 
             try:
-                ret, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-                    obj_pts, img_pts, img_shape, None, None
-                )
-            except cv2.error as e:
+                selection = selection_observations[cam]
+                selected_names = sorted(selection)
+                fitted = fit_intrinsics(
+                    obj_pts, img_pts, img_shape,
+                    validation_obj_points=[objp] * len(selected_names),
+                    validation_img_points=[selection[n][0] for n in selected_names])
+                ret, K, dist = fitted["rms"], fitted["K"], fitted["dist"]
+                rvecs, tvecs = fitted["rvecs"], fitted["tvecs"]
+                with open(os.path.join(OUTPUT, f"cam{cam}_model_selection.json"), "w") as f:
+                    json.dump(fitted["selection"], f, indent=2)
+            except (cv2.error, ValueError) as e:
+                with open(os.path.join(OUTPUT, f"cam{cam}_failure.json"), "w") as f:
+                    json.dump({"camera": cam, "error": str(e)}, f, indent=2)
                 print(f"\r  Cam {cam}/{NUM_CAMS}: FAILED — calibrateCamera "
                       f"raised: {e}                                   ")
                 intrinsics[cam] = None
@@ -543,7 +692,7 @@ def main():
             for i in range(len(obj_pts)):
                 proj, _ = cv2.projectPoints(
                     obj_pts[i], rvecs[i], tvecs[i], K, dist)
-                err = cv2.norm(img_pts[i], proj, cv2.NORM_L2) / len(proj)
+                err = reprojection_rms(img_pts[i], proj)
                 reproj_errors.append(err)
                 reproj_pts.append(proj)
 
@@ -553,6 +702,8 @@ def main():
                 "frame_names": frame_names,
                 "img_pts": img_pts, "reproj_pts": reproj_pts,
                 "reproj_errors": reproj_errors,
+                "model": fitted["model"], "diagnostics": fitted["diagnostics"],
+                "selection": fitted["selection"],
             }
             cam_rms_map[f"Cam {cam}"] = ret
 
@@ -568,6 +719,9 @@ def main():
                 "K": K.tolist(),
                 "dist": dist.flatten().tolist(),
                 "rms_error_px": round(ret, 6),
+                "distortion_model": fitted["model"],
+                "distortion_validation": fitted["diagnostics"],
+                "model_selection_rms_px": fitted["selection"]["heldout_rms_px"],
             }
             cam_path = os.path.join(OUTPUT, f"cam{cam}_intrinsics.json")
             with open(cam_path, "w") as f:
@@ -586,7 +740,7 @@ def main():
             for idx in sample_idx:
                 fname = frame_names[idx]
                 fpath = corners_dict[fname][1]
-                img = cv2.imread(fpath)
+                img = read_validation_image(fpath, SYNCED_DIR, cam, fname, FRAME_OFFSETS[cam])
                 vis = draw_corner_overlay(
                     img, img_pts[idx], reproj_pts[idx], BOARD_SIZE)
                 vis = scale_image(vis)
@@ -603,6 +757,9 @@ def main():
                 "RMS Reprojection Error (px)",
                 os.path.join(VALIDATION, "rms_all_cameras.png"),
             )
+
+        if any(intrinsics[c] is None for c in range(1, NUM_CAMS + 1)):
+            raise ValueError("At least one camera failed validated intrinsic fitting; no calibration published")
 
         # ══════════════════════════════════════════════════════════
         # STEP 3: EXTRINSIC (STEREO) CALIBRATION
@@ -641,13 +798,16 @@ def main():
                 pts_i = [cam_corners[i][fn][0] for fn in shared]
                 pts_j = [cam_corners[j][fn][0] for fn in shared]
                 try:
+                    stereo_flags = cv2.CALIB_FIX_INTRINSIC | cv2.CALIB_USE_LU
+                    if max(intrinsics[i]["dist"].size, intrinsics[j]["dist"].size) > 5:
+                        stereo_flags |= cv2.CALIB_RATIONAL_MODEL
                     ret, _, _, _, _, R_ij, T_ij, _, F_ij = cv2.stereoCalibrate(
                         obj_pts, pts_i, pts_j,
                         intrinsics[i]["K"], intrinsics[i]["dist"],
                         intrinsics[j]["K"], intrinsics[j]["dist"],
                         img_shape,
                         criteria=stereo_criteria,
-                        flags=cv2.CALIB_FIX_INTRINSIC,
+                        flags=stereo_flags,
                     )
                     all_pairs[(i, j)] = {
                         "R": R_ij, "T": T_ij, "F": F_ij,
@@ -669,15 +829,7 @@ def main():
               f"(rms ≤ {GOOD_DIRECT_RMS_PX:.1f}px) for bridging")
 
         def pair_lookup(i, j):
-            """Get (R_i_to_j, T_i_to_j, info) for any direction; None if missing."""
-            key = (min(i, j), max(i, j))
-            if key not in all_pairs:
-                return None
-            p = all_pairs[key]
-            if i < j:
-                return p["R"], p["T"], p
-            R_inv, T_inv = invert_transform(p["R"], p["T"])
-            return R_inv, T_inv, p
+            return lookup_pair(all_pairs, i, j)
 
         # ── Step 3c: pick best path per cam, compose transforms ──
         extrinsics = {}
@@ -738,20 +890,23 @@ def main():
                     method = f"bridged via {'->'.join(map(str, bridged))}"
                     method_summary["bridged"] += 1
 
-            # Invert to "camN's pose in ref's frame"
-            R_inv, T_inv = invert_transform(R_chain, T_chain)
-            baseline_m = float(np.linalg.norm(T_inv))
+            # Store the usual OpenCV world/reference-to-camera transform directly.
+            # Recompute F from this same direction for direct and bridged results.
+            F_for_viz = fundamental_from_KRT(
+                intrinsics[ref_cam]["K"], intrinsics[cam]["K"], R_chain, T_chain)
+            camera_center = -R_chain.T @ T_chain
+            baseline_m = float(np.linalg.norm(camera_center))
 
-            # Euler decomp (R = Rx · Ry · Rz; cv2 column-vec convention).
+            # Euler decomp of stored world-to-camera R = Rz @ Ry @ Rx.
             # Branch handles gimbal lock when ey ≈ ±π/2.
-            sy = np.sqrt(R_inv[0, 0] ** 2 + R_inv[1, 0] ** 2)
+            sy = np.sqrt(R_chain[0, 0] ** 2 + R_chain[1, 0] ** 2)
             if sy > 1e-6:
-                ex = np.arctan2(R_inv[2, 1], R_inv[2, 2])
-                ey = np.arctan2(-R_inv[2, 0], sy)
-                ez = np.arctan2(R_inv[1, 0], R_inv[0, 0])
+                ex = np.arctan2(R_chain[2, 1], R_chain[2, 2])
+                ey = np.arctan2(-R_chain[2, 0], sy)
+                ez = np.arctan2(R_chain[1, 0], R_chain[0, 0])
             else:
-                ex = np.arctan2(-R_inv[1, 2], R_inv[1, 1])
-                ey = np.arctan2(-R_inv[2, 0], sy)
+                ex = np.arctan2(-R_chain[1, 2], R_chain[1, 1])
+                ey = np.arctan2(-R_chain[2, 0], sy)
                 ez = 0
 
             # Aggregate quality: max link RMS along the path (worst link
@@ -762,14 +917,17 @@ def main():
             progress(
                 f"  Pair {ref_cam}-{cam}: rms={agg_rms:.3f}px  "
                 f"baseline={baseline_m*100:.2f}cm  "
-                f"T=[{T_inv[0,0]:.4f}, {T_inv[1,0]:.4f}, {T_inv[2,0]:.4f}]m  "
+                f"T=[{T_chain[0,0]:.4f}, {T_chain[1,0]:.4f}, {T_chain[2,0]:.4f}]m  "
                 f"[{method}]                 \n", end="")
 
             ext_data = {
                 "reference": f"cam{ref_cam}",
                 "target": f"cam{cam}",
-                "R": R_inv.tolist(),
-                "T": T_inv.flatten().tolist(),
+                "convention": EXTRINSICS_CONVENTION,
+                "camera_center_world": camera_center.flatten().tolist(),
+                "euler_rotation_order": "Rz @ Ry @ Rx",
+                "R": R_chain.tolist(),
+                "T": T_chain.flatten().tolist(),
                 "F": F_for_viz.tolist() if F_for_viz is not None else None,
                 "stereo_rms_px": round(agg_rms, 6),
                 "baseline_m": round(baseline_m, 6),
@@ -800,14 +958,12 @@ def main():
                 for fn in sample_shared:
                     fpath1 = cam_corners[ref_cam][fn][1]
                     fpath2 = cam_corners[cam][fn][1]
-                    img1 = cv2.undistort(cv2.imread(fpath1), K1, dist1)
-                    img2 = cv2.undistort(cv2.imread(fpath2), K2, dist2)
-                    c1 = cv2.undistortPoints(
-                        cam_corners[ref_cam][fn][0].reshape(-1, 1, 2),
-                        K1, dist1, P=K1).reshape(-1, 2)
-                    c2 = cv2.undistortPoints(
-                        cam_corners[cam][fn][0].reshape(-1, 1, 2),
-                        K2, dist2, P=K2).reshape(-1, 2)
+                    img1 = cv2.undistort(read_validation_image(fpath1, SYNCED_DIR, ref_cam, fn, FRAME_OFFSETS[ref_cam]), K1, dist1)
+                    img2 = cv2.undistort(read_validation_image(fpath2, SYNCED_DIR, cam, fn, FRAME_OFFSETS[cam]), K2, dist2)
+                    c1, valid1 = undistort_points_checked(cam_corners[ref_cam][fn][0], K1, dist1)
+                    c2, valid2 = undistort_points_checked(cam_corners[cam][fn][0], K2, dist2)
+                    if not (valid1 & valid2).all():
+                        raise ValueError("Invalid training corner inversion despite lens validation")
                     vis1, vis2 = draw_epipolar_lines(img1, img2, c1, c2, F_for_viz)
                     vis1 = scale_image(vis1)
                     vis2 = scale_image(vis2)
@@ -833,6 +989,22 @@ def main():
                 os.path.join(STEREO_VAL, "stereo_rms.png"),
             )
 
+        identity = {"reference": f"cam{REF_CAM}", "target": f"cam{REF_CAM}",
+                    "convention": EXTRINSICS_CONVENTION,
+                    "R": np.eye(3).tolist(), "T": [0., 0., 0.],
+                    "camera_center_world": [0., 0., 0.], "F": None,
+                    "baseline_m": 0., "stereo_rms_px": 0., "method": "reference",
+                    "path": [REF_CAM], "path_rms": []}
+        extrinsics[REF_CAM] = identity
+        with open(os.path.join(OUTPUT, f"cam{REF_CAM}_extrinsics.json"), "w") as f:
+            json.dump(identity, f, indent=2)
+        heldout = evaluate_heldout(intrinsics, extrinsics, test_observations, REF_CAM)
+        with open(os.path.join(OUTPUT, "heldout_epipolar.json"), "w") as f:
+            json.dump(heldout, f, indent=2)
+        print("  Independent held-out stereo evaluation:")
+        for pair, result in heldout["pairs"].items():
+            print(f"    {pair}: {result['status']}  mean={result.get('mean_px')}  p95={result.get('p95_px')}")
+
         # ══════════════════════════════════════════════════════════
         # SAVE COMBINED FILES
         # ══════════════════════════════════════════════════════════
@@ -848,29 +1020,28 @@ def main():
                 entry["K"] = intrinsics[cam]["K"].tolist()
                 entry["dist"] = intrinsics[cam]["dist"].flatten().tolist()
                 entry["rms_error_px"] = round(intrinsics[cam]["rms"], 6)
+                entry["distortion_model"] = intrinsics[cam]["model"]
+                entry["distortion_validation"] = intrinsics[cam]["diagnostics"]
+                entry["model_selection_rms_px"] = intrinsics[cam]["selection"]["heldout_rms_px"]
             else:
                 entry["error"] = "intrinsic calibration failed"
 
             if cam in extrinsics:
                 e = extrinsics[cam]
-                entry["extrinsics"] = {
-                    "reference": f"cam{REF_CAM}",
-                    "R": e["R"],
-                    "T": e["T"],
-                    "stereo_rms_px": e["stereo_rms_px"],
-                    "baseline_m": e["baseline_m"],
-                    "method": e["method"],
-                    "path": e["path"],
-                }
+                entry["extrinsics"] = dict(e)
             cam_data[f"cam{cam}"] = entry
 
         combined = {
+            "schema_version": 2,
+            "extrinsics_convention": EXTRINSICS_CONVENTION,
+            "reference_camera": f"cam{REF_CAM}",
             "checkerboard": {
                 "inner_corners": list(BOARD_SIZE),
                 "square_size_m": SQUARE_SIZE_M,
                 "board_squares": [board_cols, board_rows],
             },
             "source_episode": EPISODE,
+            "source_frame_offsets": offsets_json,
             "cameras": cam_data,
         }
         combined_path = os.path.join(OUTPUT, "calibration_all_cameras.json")
@@ -898,6 +1069,8 @@ def main():
                 "frames_scanned": info["scanned"],
                 "frames_detected": info["detected"],
                 "detected_frame_numbers": info["frame_numbers"],
+                "source_frame_offset": FRAME_OFFSETS[cam],
+                "detected_source_frame_numbers": [n + FRAME_OFFSETS[cam] for n in info["frame_numbers"]],
                 "elapsed_sec": info["elapsed_sec"],
             }
         log_path = os.path.join(OUTPUT, "frame_extraction_log.json")
@@ -907,7 +1080,7 @@ def main():
 
         # ── Summary ───────────────────────────────────────────────
         print(f"\n{'=' * 70}")
-        print("CALIBRATION COMPLETE")
+        print("CALIBRATION CANDIDATE RESULTS")
         print("=" * 70)
         print(f"  Board: {board_cols}x{board_rows} squares, "
               f"{BOARD_SIZE[0]}x{BOARD_SIZE[1]} inner corners, "
@@ -935,10 +1108,20 @@ def main():
             else:
                 print(f"    Pair {REF_CAM}-{cam}: FAILED (no path)")
 
-        print(f"\n  Output: {OUTPUT}/")
-        print("  Done!")
+        if not heldout["passed"]:
+            raise ValueError("Independent held-out geometry failed; previous calibration preserved")
+        backup = publish_calibration(OUTPUT, TARGET_OUTPUT)
+        published = True
+        print(f"\n  Output: {TARGET_OUTPUT}/")
+        if backup:
+            print(f"  Previous calibration backed up: {backup}")
+        print("  Done — lens validity and independent held-out checks passed.")
 
     finally:
+        if not published and os.path.isdir(OUTPUT):
+            failed = TARGET_OUTPUT + f".failed-{time.time_ns()}"
+            os.rename(OUTPUT, failed)
+            print(f"  Unpublished diagnostic output retained: {failed}")
         print(f"\n  Cleaning up temp dir...")
         shutil.rmtree(tmpdir, ignore_errors=True)
 

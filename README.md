@@ -1,18 +1,22 @@
 # GoPro Multi-Camera 3D Vision Rig
 
-Frame-accurate sync, intrinsic calibration, and extrinsic (stereo) calibration pipeline for a multi-camera GoPro Hero 10 rig used in 3D vision work.
+Synchronization, validated intrinsic/extrinsic calibration, and undistorted video export for a multi-camera GoPro Hero 10 rig used in 3D vision work.
 
 ## What This Does
 
-**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side preview grid with audio, per-episode metadata JSON, and a sync report with sanity checks. FPS is probed from the actual video (supports 60fps, 120fps, etc.).
+**Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side sync preview with audio that retains lens distortion, per-episode metadata JSON, and a sync report with sanity checks. FPS is probed from the actual video (supports 60fps, 120fps, etc.).
 
 **Calibration pipeline** (`run_calibration.py`) — Two-phase calibration from a synced checkerboard episode:
 
-1. **Intrinsic calibration** — All cameras are read in lockstep (same frame numbers) via OpenCV. For each sampled frame, checkerboard detection runs in parallel across cameras using `findChessboardCornersSB` (sector-based, faster than classic) on downscaled frames (~960px wide), then refines at full resolution via `cornerSubPix`. Early stopping fires after `--max-frames` (default 60) frames where ALL cameras detected the board. Each camera's detections then go through `cv2.calibrateCamera()`. Outputs minimal intrinsics JSON (K matrix, distortion coefficients, image size, RMS error).
+1. **Intrinsic calibration** — Reads cameras in lockstep, detects checkerboards in parallel on downscaled frames, then refines corners at full resolution. It globally separates training, model-selection, and final-test frames, fits several OpenCV lens-model candidates, and requires both a valid distortion mapping and validation observations before selecting a model. Outputs include K, distortion coefficients, image dimensions, fit errors, and validation diagnostics.
 
-2. **Extrinsic calibration** — Finds frames where the checkerboard was detected in both the reference camera (configurable via `--ref-cam`) and each other camera, then runs `cv2.stereoCalibrate()` with fixed intrinsics. Because detection uses the same frame numbers across cameras (lockstep), shared frames are guaranteed to be truly time-synced. Outputs per-pair rotation, translation, essential/fundamental matrices, baseline distance, and stereo RMS — all expressed in the reference camera's coordinate frame (origin = `--ref-cam`).
+2. **Extrinsic calibration** — Uses shared training frames with fixed intrinsics, calibrates viable camera pairs, and bridges through intermediate cameras where necessary. Outputs use the usual OpenCV **world-to-camera** convention: `X_cam = R @ X_ref + T`, with the reference camera defining world coordinates. Fundamental matrices always map reference-image points to target-image epipolar lines.
 
-Both phases share the same corner detections. Source frame numbers are embedded in filenames (e.g. `frame_000120.jpg` = source frame 120), so matching by filename guarantees temporal correspondence across synced cameras. The lockstep approach ensures all cameras process identical frame numbers — this is critical for stereo calibration accuracy. Detected frames go to a system temp directory and are automatically cleaned up.
+Both phases share the same corner detections. Source frame numbers identify corresponding frames in already-synchronized videos; reading in lockstep does not correct any residual synchronization error. Model-selection and final-test frames never enter intrinsic or stereo parameter fitting, and the final-test set is also excluded from model selection. Calibration is built in a staging directory and published only when every required camera and final-test geometry check passes. A failed run retains diagnostic artifacts and leaves an existing published calibration unchanged.
+
+**Video export** (`export_calibrated_videos.py`) — Applies validated lens calibration and any measured residual frame offsets to produce `synced_undistorted/` and matching `calibration_undistorted/`. The exported videos keep the source resolution and frame rate; their calibration retains K and OpenCV extrinsics and sets distortion to zero. `synced_raw/` remains the original, lens-distorted intermediate. The episode organizer runs this export by default.
+
+**Undistorted preview** (`make_undistorted_preview.py`) — Builds a labeled grid of every camera from the completed undistorted export. Every tile uses the same sampled frame indices, with audio from the saved reference camera. The organizer generates this preview after each episode's export.
 
 ## Directory Layout
 
@@ -21,6 +25,14 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 ├── sync_pipeline.py                # Multi-episode audio sync
 ├── run_calibration.py              # Intrinsic + extrinsic calibration (with bridging)
 ├── run_eval_epipolar.py            # Epipolar-geometry validation
+├── export_calibrated_videos.py     # Synchronized, undistorted videos + matching calibration
+├── make_undistorted_preview.py     # All-camera grid from completed undistorted videos
+├── calibration_geometry.py        # Convention, projection, and lens validity helpers
+├── calibration_fit.py             # Lens candidates and held-out model selection
+├── calibration_observations.py    # Source-checked detections and global frame split
+├── calibration_frame_offsets.py  # Validated logical-to-source frame offsets
+├── calibration_validation.py     # Reuse checks and backed-up episode copies
+├── migrate_calibration.py         # Backed-up migration of legacy extrinsics
 ├── viz_calibration.py              # 3D camera-pose visualizer (Plotly HTML)
 ├── sync_vis.py                     # Interactive ±2-frame sync fine-tune
 ├── pyproject.toml                  # uv project metadata + deps
@@ -33,9 +45,14 @@ Both phases share the same corner detections. Source frame numbers are embedded 
 ├── 2/ ... N/                       # Camera 2–N raw footage (12 cams in this project)
 └── output/                         # All pipeline output (gitignored)
     ├── episode_0001/                # KITTI-style self-contained episode
-    │   ├── synced_raw/
+    │   ├── synced_raw/              # Synchronized intermediate; lens distortion remains
     │   │   ├── cam1_synced.mp4 ... camN_synced.mp4
-    │   ├── episode_0001_preview.mp4
+    │   ├── synced_undistorted/      # Final videos, with lens correction and frame offsets applied
+    │   ├── calibration_undistorted/ # Matching K, zero distortion, unchanged OpenCV extrinsics
+    │   ├── episode_0001_preview.mp4 # Initial sync preview; lens distortion remains
+    │   ├── episode_0001_undistorted_preview.mp4 # Final all-camera preview
+    │   ├── episode_0001_undistorted_preview.jpg # Preview poster
+    │   ├── episode_0001_undistorted_preview.json # Inputs, frame mapping, and verification
     │   ├── episode_0001_sync_report.md
     │   ├── sync_adjustments.json   # written by sync_vis.py (optional)
     │   ├── metadata/
@@ -43,10 +60,13 @@ Both phases share the same corner detections. Source frame numbers are embedded 
     │   │   └── *.THM
     │   └── calibration/             # per-episode calibration (KITTI-style;
     │       ├── cam1_intrinsics.json ... camN_intrinsics.json
-    │       ├── cam{i}_extrinsics.json   # one per non-ref camera, in --ref-cam's frame
+    │       ├── cam{i}_extrinsics.json   # world-to-camera R,T; reference has identity pose
     │       ├── calibration_all_cameras.json
     │       ├── checkerboard_config.json
     │       ├── frame_extraction_log.json   # source frame numbers used per cam
+    │       ├── observation_split.json     # training, selection, and final-test frames
+    │       ├── cam{i}_model_selection.json # candidate fits and selection diagnostics
+    │       ├── heldout_epipolar.json      # untouched final-test pair measurements
     │       ├── camera_poses.html       # written by viz_calibration.py
     │       └── validation/
     │           ├── cam1/ ... camN/
@@ -125,7 +145,7 @@ The pipeline:
 2. Extracts audio, runs `scipy.signal.correlate()` against the reference camera (`--ref-cam`).
 3. Computes per-camera trim offsets and a common duration.
 4. Stream-copies (`-c copy`) each camera's video with the computed trim — no quality loss.
-5. Generates an N-camera grid preview from LRV proxy files (falls back to scaled MP4 if LRV missing). Layout is biased wider-than-tall: `N≤3` → single row, otherwise `cols = ceil(N/2)`, `rows = ceil(N/cols)` (so 12 → 6×2, 5 → 3×2, 8 → 4×2). Cam 1 is top-left, filling row-major.
+5. Generates an initial N-camera sync preview from LRV proxy files (falls back to scaled MP4 if LRV missing), retaining lens distortion and using at most 30 seconds by default. Layout is biased wider-than-tall: `N≤3` → single row, otherwise `cols = ceil(N/2)`, `rows = ceil(N/cols)` (so 12 → 6×2, 5 → 3×2, 8 → 4×2). Cam 1 is top-left, filling row-major. This initial preview can fall back to the reference camera alone if the grid fails; it does not show the later undistorted export.
 6. Writes a sync report with sanity checks (confidence, offset magnitude, duration spread).
 
 ### How Sync Works
@@ -136,7 +156,7 @@ Key detail: `scipy.signal.correlate(ref, other)` returns a positive lag when `ot
 
 ## Episode Grouping (`organize_episodes.sh`)
 
-KITTI-style packaging: every `output/episode_NNNN/` is a self-contained dataset with its own `synced_raw/`, `metadata/`, and `calibration/` folder. Some recordings are pure dataset clips and reuse a calibration captured from a different episode of the same shoot — `organize_episodes.sh` runs sync, runs calibration on each "calibration source" episode, and then **copies the calibration folder into every episode that shares it** (intentional duplication, fine for self-contained packages).
+KITTI-style packaging: each selected `output/episode_NNNN/` keeps synchronized source video, metadata, and calibration, and exports final `synced_undistorted/` videos with matching `calibration_undistorted/`. Some recordings reuse calibration from another episode of the same shoot. `organize_episodes.sh` runs synchronization, calibrates each group's source episode, copies validated calibration into the other group members, and then exports every selected episode exactly once, including when an episode appears in multiple groups. It creates that episode's all-camera undistorted preview immediately after the export succeeds.
 
 ```bash
 ./organize_episodes.sh --base . --cams 12 --board 9x12 --square-size 0.03 \
@@ -155,9 +175,51 @@ Each `--groups` arg is a comma-separated list of episode indices; the **first in
 | `--max-frames` | `0` | Calibration `--max-frames` (0 = no cap) |
 | `--groups` | *required* | One arg per group; comma-separated episode indices, first is calib source |
 | `--skip-sync` | off | Don't run `sync_pipeline.py` (assume episodes already synced) |
-| `--skip-calib` | off | Don't run calibration; only copy already-existing calibration folders |
+| `--skip-calib` | off | Reuse only existing calibration that passes validation; fail without copying if missing/invalid |
+| `--skip-export` | off | Skip final video export and its undistorted preview for a calibration-only workflow |
 
-After the script finishes, every `output/episode_NNNN/` is self-contained — drop it on a downstream machine and it has everything needed for 3D reconstruction.
+The final reconstruction inputs are each selected episode's `synced_undistorted/` and `calibration_undistorted/`. Keep those together. An export or undistorted-preview failure stops the organizer with a nonzero status; `--skip-calib` still exports and makes the preview when existing calibration passes validation. Add `--skip-export` to perform only synchronization/calibration work.
+
+Existing source calibration is checked before reuse: camera coverage, intrinsics and full-sensor lens validity, explicit conventions, matching individual/combined files, directional F, and passing independent final-test evidence. Without `--skip-calib`, an invalid source is recalibrated; with it, the script stops before copying. Destination copies are staged and validated, and existing calibration is preserved in a `calibration.backup-*` directory. Migration alone cannot make an invalid lens model or missing validation evidence pass these checks.
+
+## Exporting Synchronized, Undistorted Video
+
+To export an episode whose `calibration/` has already passed validation:
+
+```bash
+uv run python export_calibrated_videos.py --base . --episode episode_0004 --cams 10
+```
+
+The exporter reads `synced_raw/` and `calibration/`, then writes `synced_undistorted/` and `calibration_undistorted/`. Source videos and raw calibration stay intact. It exports the common valid frame range at the source resolution and frame rate. Use the matching output calibration, whose distortion coefficients are zero; applying the original distortion coefficients again would distort the corrected images.
+
+The current exporter supports 8-bit input video and writes 8-bit output. It rejects 10-bit input instead of silently reducing its bit depth; the camera-settings section above does not imply 10-bit export support.
+
+Output K equals each camera's original calibrated K. Keeping that image canvas crops some wide-angle edge content; the exporter does not estimate a wider-field replacement K. Camera poses retain the OpenCV `X_cam = R @ X_ref + T` convention. This is lens undistortion, not pairwise stereo rectification: calibrated multi-view reconstruction can use these videos and camera poses directly. Rectification is needed only for downstream algorithms that specifically require rectified stereo images.
+
+Residual timing corrections use `source_frame = logical_frame + offset`. Saved `source_frame_offsets` are inferred only when the calibration's `source_episode` matches the exported episode. A copied calibration does not establish another episode's timing. To apply offsets measured for that episode, supply an explicit file:
+
+```bash
+uv run python export_calibrated_videos.py --base . --episode episode_0004 --cams 10 \
+    --frame-offsets episode_0004_offsets.json
+```
+
+The file is a JSON mapping such as `{"cam4": -1, "cam6": -1}`; omitted cameras use zero. Use values measured from that episode rather than copying these example values. The processed calibration resets `source_frame_offsets` to zero because those shifts are already applied to the exported videos. Its `export_timeline` preserves the applied `frame_offsets`, starting logical frame, frame count, and FPS.
+
+`--encoder auto` selects HEVC `hevc_videotoolbox` on macOS and H.264 `libx264` elsewhere. Use `--encoder hevc_videotoolbox` or `--encoder libx264` to select one explicitly.
+
+### All-Camera Undistorted Preview
+
+After a complete export, generate or refresh its preview with:
+
+```bash
+uv run python make_undistorted_preview.py --base . --episode episode_0004
+```
+
+The script infers camera count from `synced_undistorted/export_manifest.json`, verifies the completed videos against that manifest, and requires a shared frame count and FPS. It reads the exported videos directly, so their lens correction and timing offsets are already applied. No additional calibration or offset file is needed. `--decode-accel auto` uses VideoToolbox on macOS; `none` and `videotoolbox` select decoding explicitly.
+
+Every camera appears in numeric order, left to right and then top to bottom, with a `CAM N` label. Tiles are 640×360, preserving aspect ratio with padding when needed. Ten cameras produce a 5×2, 3200×720 H.264 grid. Sampling uses the same source frame indices in every tile and limits preview FPS to at most 30; for 119.88 FPS sources, it selects frames 0, 4, 8, … at 30000/1001 FPS (about 29.97). The preview covers the full exported clip and copies audio from the calibration's reference camera when available (cam3 for episode 4).
+
+Outputs are `output/<episode>/<episode>_undistorted_preview.mp4`, a matching JPEG poster, and a JSON record of camera order, source signatures, frame mapping, and verified output dimensions/FPS. Episode 4's full camera videos remain 3840×2160 at 119.88 FPS; only the viewing preview is reduced in size and frame rate. The earlier `<episode>_preview.mp4` is the separate, lens-distorted sync diagnostic.
 
 ## Running Calibration
 
@@ -178,12 +240,17 @@ uv run python run_calibration.py --board 9x12 --square-size 0.03 --base . --epis
 | `--ref-cam` | `1` | Reference camera (its frame is the world origin; all extrinsics are expressed in it) |
 | `--every` | `30` | Process every Nth frame (30 = ~4fps at 120fps, 1 = all) |
 | `--max-frames` | `60` | Stop after this many frames where ALL cameras detected the board (0 = no limit) |
+| `--corners-cache` | *none* | Save or reuse corner detections after validating the source videos and detection configuration |
+| `--output-dir` | `<episode>/calibration` | Optional calibration destination; publication still requires all checks to pass |
+| `--frame-offsets` | *all zero* | JSON integer offsets; source frame = logical frame + camera offset |
 
 ### Phase 1: Intrinsic Calibration
 
-All cameras are read in lockstep — every camera advances to the same frame number together. For each sampled frame (`--every`, default 30), all cameras retrieve and decode the frame, then `cv2.findChessboardCornersSB` runs in parallel across cameras via `ThreadPoolExecutor`. For 4K frames, detection runs on a downscaled image (~960px wide), then corners are refined at full resolution via `cornerSubPix`. Early stopping fires after `--max-frames` (default 60) frames where ALL cameras detected the board — this guarantees enough shared frames for stereo calibration. Only frames where the checkerboard is detected are saved to disk. The board size is specified via `--board` (e.g. `9x12` = 9 columns × 12 rows of squares → 8×11 inner corners).
+All cameras advance to the same source frame together. For each sampled frame (`--every`, default 30), `cv2.findChessboardCornersSB` runs in parallel via `ThreadPoolExecutor`; 4K images are downscaled to approximately 960 pixels wide for detection, followed by full-resolution `cornerSubPix` refinement. Early stopping fires after `--max-frames` shared detections, or scanning ends at the available footage. The board size is specified in squares: `--board 9x12` means 8×11 inner corners.
 
-Detected frames go through `cv2.calibrateCamera()`. The output per camera is a minimal JSON:
+Source frames are split globally across all cameras. Every fifth distinct frame in the union of detected observations becomes a final-test frame. Every fifth frame in the remaining pool becomes a model-selection frame, leaving approximately 64% training, 16% selection, and 20% final testing. No reserved frame enters intrinsic or stereo parameter fitting; final-test frames never enter model selection either. `observation_split.json` records the exact split.
+
+Each camera needs at least five training and three model-selection detections. Training detections go through `cv2.calibrateCamera()` using `opencv5`, `opencv4` (k3 fixed), `rational_low`, `rational6`, and `rational8` candidates. A candidate must pass the distortion validity screen and have model-selection reprojection RMS at most 2 px; among scores within 0.05 px of the best, fewer free distortion coefficients are preferred. Rational candidates also must have no positive-radius denominator poles, even outside the sampled sensor domain: a nearly cancelled pole can hide unstable extrapolation behind a low fit error. This conservative rule also applies when reusing calibration. `camN_model_selection.json` records candidates and rejection reasons. A small training RMS alone cannot qualify a model. The selected intrinsics include these core fields:
 
 ```json
 {
@@ -194,13 +261,19 @@ Detected frames go through `cv2.calibrateCamera()`. The output per camera is a m
 }
 ```
 
-`K` is the 3x3 camera matrix (focal lengths fx/fy in pixels, principal point cx/cy). `dist` is the 5-coefficient distortion vector (radial k1/k2/k3, tangential p1/p2). These two are everything needed for undistortion via `cv2.undistort(img, K, dist)` or downstream stereo work. Anything else (optimal new camera matrix, undistort ROI) is recomputable from K and dist, so it's not stored.
+`K` contains focal lengths fx/fy and principal point cx/cy in pixels. OpenCV coefficient order is `[k1, k2, p1, p2]` for four coefficients, `[k1, k2, p1, p2, k3]` for five, and `[k1, k2, p1, p2, k3, k4, k5, k6]` for rational models. The full JSON also records the selected model and diagnostics. The validity screen checks for lens-mapping folds and failed inverse mapping across the sensor. Passing this numerical screen does not establish physical accuracy outside observed checkerboard coverage.
+
+Use `--corners-cache PATH` to save/reuse a `.npz` detection cache. Reuse checks source video names, sizes, modification times, board dimensions, and camera IDs. A cache retains its original sampled observations; use a new cache when changing sampling settings. Use `--output-dir PATH` when evaluating a separate calibration destination. `run_calibration.py` estimates calibration; `export_calibrated_videos.py` produces the corresponding undistorted video, and the organizer invokes both stages by default.
+
+For a measured residual timing offset, pass a JSON file such as `{"cam4": -1, "cam6": -1}` through `--frame-offsets`. At logical frame n, these cameras read source frame n−1; omitted cameras use zero. Keys must be `camN`, values must be integers, and reads are restricted to the common valid video range. This changes logical frame selection only: raw videos are not trimmed or rewritten. The detection cache checks offsets on reuse; changed offsets require a new cache. Combined calibration and split metadata record all cameras' offsets under `source_frame_offsets`, preserving the original `source_episode` when calibration is copied.
+
+Runs build their outputs in `.calibration-staging-*` beside the destination. Publication requires valid intrinsics for every camera and a passing final check for every reference→target pair: at least three measurable final-test frames, mean epipolar error below 2 px, p95 below 5 px, and no invalid points. Results are in `heldout_epipolar.json`; no high residuals are discarded. Failed runs retain their outputs as `TARGET.failed-TIMENS`, including `camN_failure.json` when a camera fit fails. A successful replacement preserves the previous calibration as `TARGET.backup-TIMENS`.
 
 ### Phase 2: Extrinsic (Stereo) Calibration
 
-Using the corners already detected in Phase 1, the script finds "shared frames" — frames where both the reference camera (`--ref-cam`) and camera N detected the board at the same source frame number. Because Phase 1 processes all cameras in lockstep on the same frame numbers, shared frames are guaranteed to be truly time-synced (same physical moment, board in same pose). With `--max-frames 60`, at least 60 such shared frames are guaranteed for every camera pair.
+Using the training corners from Phase 1, the script finds shared frames where both cameras detected the board at the same source frame number. Withheld frames remain excluded. The number of available training pairs therefore depends on detections, the validation split, and footage length; `--max-frames 60` does not guarantee 60 training observations per pair.
 
-For each candidate pair, `cv2.stereoCalibrate()` runs with the `CALIB_FIX_INTRINSIC` flag — it trusts the per-camera K and dist from Phase 1 and only solves for the rotation R and translation T between cameras. The raw stereoCalibrate output is inverted so that R and T express **camN's pose in the reference camera's coordinate frame** (ref-cam = origin).
+For each candidate pair, `cv2.stereoCalibrate()` runs with `CALIB_FIX_INTRINSIC`, solving rotation and translation using the selected K and distortion parameters. The final saved transform maps **reference/world coordinates into the target camera**, including when pair transforms must be reversed or chained.
 
 **Bridging for wide-baseline rigs.** With many cameras (e.g. a 12-cam 2×6 grid), some `(ref, N)` pairs rarely share enough frames — `stereoCalibrate` either skips for too few shared frames or returns a poor RMS. Phase 2 first computes **every viable `(i, j)` pair** (~`N(N-1)/2` calls; ~1 min added for 12 cams) and builds a graph of edges that meet a quality bar (`shared ≥ 8 frames` AND `rms ≤ 1.5 px`). For each non-ref camera, the script prefers the direct `(ref, N)` pair if it meets the quality bar; otherwise it BFS-searches the **shortest hop-count path** from `ref` to `N` through good edges and chains the transforms. Each per-cam JSON records the path used:
 
@@ -216,25 +289,50 @@ The output per pair:
 {
   "reference": "cam3",
   "target": "cam5",
+  "convention": "world_to_camera",
   "R": [[...], [...], [...]],
   "T": [tx, ty, tz],
   "F": [[...], [...], [...]],
   "stereo_rms_px": 0.928,
   "baseline_m": 0.281,
   "euler_deg": {"rx": -0.87, "ry": 0.01, "rz": -0.29},
+  "euler_rotation_order": "Rz @ Ry @ Rx",
   "method": "direct",
   "path": [3, 5],
   "path_rms": [0.928]
 }
 ```
 
-`R` is the 3x3 rotation of camN relative to the reference. `T` is camN's optical center position in the reference's coordinate frame (metres; OpenCV convention: +X right, +Y down, +Z forward from the reference's viewpoint). `baseline_m` is `‖T‖`. `F` is the fundamental matrix in pixel coordinates (for direct pairs, from `stereoCalibrate`; for bridged pairs, derived from chained `K, R, T`). `stereo_rms_px` is the stereo reprojection error — for direct pairs this is the `stereoCalibrate` rms; for bridged pairs it is the **maximum link rms along the chain** (worst weak link in the path). `euler_deg` decomposes R as `R = Rx(rx) · Ry(ry) · Rz(rz)` (extrinsic XYZ / intrinsic ZYX, applied to a column vector with Rz first) — for quick sanity checking only. `method` and `path` record whether the extrinsics came from a direct pair or were chained through intermediates (e.g. `"bridged via 3->5->6"`, `path: [3, 5, 6]`, `path_rms: [0.928, 0.955]`).
+For column vectors, the coordinate definitions are:
 
-The `calibration_all_cameras.json` combines both intrinsics and extrinsics for all cameras in one file, alongside the checkerboard parameters. Each camera's `extrinsics` block also carries `method` and `path` so you can audit which pairs were direct vs. bridged.
+```python
+X_cam = R @ X_ref + T       # saved OpenCV world-to-camera transform
+C_ref = -R.T @ T           # camera optical center in reference/world coordinates
+X_ref = R.T @ X_cam + C_ref
+```
+
+`T` is the reference origin's position in target-camera coordinates, in metres. Each camera uses +X right, +Y down, +Z forward. `baseline_m = ‖T‖ = ‖C_ref‖`. The reference camera itself has `R = I`, `T = 0`, and no stereo `F`.
+
+`F` uses undistorted pixel coordinates and satisfies `x_target.T @ F @ x_ref = 0`. It is recomputed from K and the final reference→target transform for every pair. This fixes the legacy direction bug for targets numbered below the reference: with cam3 as reference, the original `(1,3)` and `(2,3)` matrices mapped in the opposite direction. Reversing a pair requires transposing F as well as inverting its rigid transform.
+
+`stereo_rms_px` is the direct stereo fit RMS, or the maximum link RMS for a bridged path. `method`, `path`, and `path_rms` retain that provenance. `euler_deg` describes the saved world-to-camera rotation with `R = Rz(rz) @ Ry(ry) @ Rx(rx)`; use R itself for calculations.
+
+`calibration_all_cameras.json` combines intrinsics, extrinsics, and checkerboard parameters. New files declare `"schema_version": 2`, `"extrinsics_convention": "world_to_camera"`, and a `"reference_camera"` such as `"cam3"`. Every extrinsics block also declares `"convention": "world_to_camera"`.
+
+### Migrating Existing Calibration
+
+Readers explicitly support the repository's legacy files: a missing extrinsics `convention` means **camera-to-world**. Unknown conventions, contradictory metadata, and conflicting reference cameras are rejected. To rewrite existing JSONs into the new convention:
+
+```bash
+uv run python migrate_calibration.py --calibration-dir output/episode_0004/calibration
+uv run python viz_calibration.py --base . --episode episode_0004
+```
+
+The migration validates inputs first, backs up the entire calibration directory to a timestamped sibling `calibration_backup_*`, converts legacy R/T, recomputes every target F, and updates individual and combined JSONs consistently. Repeating it is a no-op; it never inverts an already tagged world-to-camera transform a second time. Intrinsic files remain byte-for-byte unchanged. Migration does **not** refit distortion, improve calibration observations, or regenerate old error charts and epipolar overlays. Preserve the backup and rerun validation or calibration as needed.
 
 ## 3D Camera-Pose Visualizer (`viz_calibration.py`)
 
-Reads `calibration_all_cameras.json` and renders every camera as a frustum in the reference camera's coordinate frame, with hover tooltips showing K, intrinsic/stereo RMS, baseline, and (for bridged cams) the chain of intermediates used.
+Reads either supported calibration convention, converts world-to-camera extrinsics to camera centers/axes for drawing, and renders frusta in the reference frame. Hover tooltips show K, intrinsic/stereo RMS, baseline, and bridging paths. Changing the stored convention preserves the displayed rig geometry.
 
 ```bash
 # Generate camera_poses.html in EVERY episode's calibration folder
@@ -244,7 +342,7 @@ uv run python viz_calibration.py --base .
 uv run python viz_calibration.py --base . --episode episode_0002 --show
 ```
 
-`organize_episodes.sh` invokes the all-episodes form automatically as its final step, so every episode in your output ships with its own `camera_poses.html` next to its calibration JSONs.
+`organize_episodes.sh` invokes the all-episodes form after video export, so calibrated episodes have `camera_poses.html` next to their raw-camera calibration JSONs. This rendering step also runs when `--skip-export` is used.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -267,7 +365,7 @@ Use this to **qualitatively verify** the calibration: a well-calibrated 6×2 GoP
 
 ### What to Look For
 
-**Intrinsic RMS** should be under ~0.5 px for GoPro Wide at 4K. Values above 1px suggest poor board visibility, motion blur, or too few frames.
+**Intrinsic RMS** summarizes the fitted observations, not full-frame lens validity. Inspect held-out errors and distortion diagnostics together with it: a subpixel fit can still fold near image edges. Large residuals can indicate poor board visibility, blur, an unsuitable model, or insufficient observations.
 
 **Stereo RMS** should be under ~1 px for a well-calibrated pair. A large stereo RMS (like 20+ px) indicates a problem — common causes: the board wasn't fully visible to both cameras simultaneously, there's a sync error, or the camera was at a very oblique angle to the board. For **bridged pairs** the reported `stereo_rms_px` is the worst link in the chain (`max(path_rms)`); inspect `path_rms` in the JSON if a bridged pair looks borderline — one weak intermediate hop dominates the score.
 
@@ -281,7 +379,7 @@ The `validation/` folder contains visual sanity checks:
 
 **Intrinsic validation** (`validation/cam{N}/`):
 - `corners_frame_*.jpg` — 4 sample frames per camera showing detected corners (green, from `drawChessboardCorners`) overlaid with reprojected corners (red circles). Green and red should overlap tightly.
-- `reproj_error_per_frame.png` — bar chart of per-frame reprojection error, color-coded green (< 0.06px) / yellow (< 0.1px) / red (> 0.1px) with a mean line.
+- `reproj_error_per_frame.png` — per-frame RMS in pixels: `sqrt(sum(dx² + dy²) / N)`, equivalently L2 norm divided by `sqrt(N)`. Colors are green at ≤0.5 px, amber above 0.5 through 1 px, and red above 1 px. The legacy chart divided by N and understated RMS by `sqrt(88) ≈ 9.38` for this board; its old 0.06/0.1 thresholds are obsolete. Overall calibration RMS from OpenCV was not affected by that chart bug.
 
 **Intrinsic summary** (`validation/rms_all_cameras.png`) — cross-camera RMS comparison bar chart.
 
@@ -291,26 +389,42 @@ The `validation/` folder contains visual sanity checks:
 
 ## Standalone Epipolar Eval (`run_eval_epipolar.py`)
 
-A separate, post-calibration sanity check that re-detects the checkerboard on a different sample of synced-video frames and measures **point-to-line epipolar distance** for every pair `(ref-cam, camN)`. This is independent of the calibration step's own validation: it reads the saved `cam{N}_intrinsics.json` + `cam{N}_extrinsics.json`, recomputes `F` from `K1, K2, R, T`, undistorts both images and points, and reports `mean / median / p95 / max` of the per-corner epipolar distances.
+A post-calibration check that re-detects checkerboards and measures **point-to-line epipolar distance** for each reference→target pair. It reads saved intrinsics/extrinsics, validates lens mappings, recomputes F in the correct direction, and reports mean, median, p95, and maximum distance. Point undistortion checks numerical convergence by projecting back to the original pixels. Its video sampling can overlap calibration frames; the calibration pipeline's separate final-test split provides the explicitly held-out check.
 
 ```bash
-uv run python run_eval_epipolar.py --base . --episode episode_0001 --cams 12 --ref-cam 1
+uv run python run_eval_epipolar.py --base . --episode episode_0001 --cams 12
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `.` | Project root |
 | `--episode` | `episode_0001` | Synced episode to evaluate |
+| `--calibration-dir` | `<episode>/calibration` | Read another calibration directory without activating it for the episode |
 | `--cams` | `12` | Number of cameras |
-| `--ref-cam` | `1` | Must match the value used at calibration time |
+| `--ref-cam` | *infer from calibration* | Optional explicit reference; a mismatch with saved calibration fails |
 | `--board` | `9x12` | Board size as COLSxROWS in squares |
 | `--num-frames` | `10` | Frames to sample (uniformly across the middle 10%–90% of the video) |
+| `--frame-indices` | *automatic sampling* | Explicit ascending, unique, nonnegative logical frame indices; overrides `--num-frames` |
+| `--frame-offsets` | *source metadata or zero* | Explicit JSON mapping; otherwise saved offsets apply only when `source_episode` matches the evaluated episode |
+| `--out` | `<episode>/calibration/validation/epipolar_eval` | Output directory for reports and overlays |
+| `--allow-invalid-intrinsics` | off | Measure usable points for diagnosis despite an invalid lens model; the result remains FAILED |
 
-Output: `output/calibration/validation/epipolar_eval/`
+Output: `output/<episode>/calibration/validation/epipolar_eval/`
+
 - `pair_{REF}_{N}_f<frame>_cam*.jpg` — annotated overlays (green ≤ 1px, yellow ≤ 2px, red > 2px)
-- `epipolar_eval_summary.json` — per-pair statistics
+- `epipolar_eval_summary.json` — every expected pair, measurements, status/reasons, detection coverage, failed reads, invalid points, high-error counts, and lens diagnostics
 
-Verdict: **mean < 1 px = good, < 2 px = acceptable, > 2 px = poor**. Frames whose worst point exceeds 10 px are auto-rejected (likely a bad detection or a partially occluded board).
+All finite residuals remain in the statistics, including errors above 10 pixels; high-error frames are counted rather than discarded. A pair with mean below 1 px is GOOD, from 1 to below 2 px is OK, and at least 2 px or any frame above 10 px is POOR. Invalid geometry/lens mappings are FAILED, and pairs without usable measurements are INCOMPLETE. Missing pairs remain visible in the report instead of disappearing. Overall quality reflects the worst pair and coverage; POOR, FAILED, and INCOMPLETE return nonzero exit codes. Diagnostic mode cannot turn invalid intrinsics into a passing calibration.
+
+Frame-offset metadata describes timing in the calibration's source episode. Reusing episode 2 calibration for episode 4 does not imply that episode 4 has the same timing offset or has been resynchronized. The evaluator uses zero offsets across different episodes unless an explicit `--frame-offsets` file is supplied.
+
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+The suite covers independent projection geometry, invalid lens models, convention migration, globally separate cached observations, evaluator failures, publication rollback, validated episode reuse/copy, and positive/negative frame offsets. Tests use synthetic geometry and temporary files; they do not alter captured videos.
 
 ## GoPro File Types
 
@@ -357,11 +471,11 @@ Keyboard shortcuts: <kbd>←</kbd>/<kbd>→</kbd> step ±1 frame · <kbd>shift</
 
 Performance: on first launch the tool generates a 720p H.264 proxy per camera (parallel, ~30 s/cam). Subsequent launches reuse the cached proxies (proxy is regenerated only if its source `cam{N}_synced.mp4` is newer). Use `--no-proxy` to bypass and serve originals.
 
-## Next Steps (Not Yet Implemented)
+## Downstream Reconstruction
 
-- **Undistortion** — Apply the calibrated intrinsics to remove lens distortion before 3D reconstruction.
-- **Stereo rectification** — Use extrinsics to compute rectification transforms (`cv2.stereoRectify`) for aligned epipolar geometry.
-- **Dense matching / depth** — Feed undistorted, rectified, synced frames into a stereo or multi-view stereo pipeline.
+- **Multi-view reconstruction / 3DGS** — Use `synced_undistorted/` with `calibration_undistorted/`; the output pixels already have lens correction applied.
+- **Optional stereo rectification** — For a method requiring rectified stereo pairs, compute pair-specific transforms from the saved K/R/T. This step is not required for general calibrated multi-view reconstruction and is not performed by the exporter.
+- **Dense matching / depth** — Feed the exported synchronized frames and matching cameras into the chosen reconstruction pipeline.
 
 ## License
 

@@ -22,9 +22,12 @@ import argparse
 import json
 import os
 import webbrowser
+import re
 
 import numpy as np
 import plotly.graph_objects as go
+
+from calibration_geometry import EXTRINSICS_CONVENTION, world_to_camera
 
 
 # ─── CLI ──────────────────────────────────────────────────────────
@@ -120,15 +123,22 @@ def build_traces(camera_data, ref_cam, frustum_depth):
         cd = camera_data[cam_id]
         is_ref = (cam_id == ref_cam)
 
-        if is_ref:
+        if cd.get("R") is not None:
+            ext = dict(cd)
+            ext.setdefault("reference", f"cam{ref_cam}")
+            R, t = world_to_camera(ext, expected_reference=f"cam{ref_cam}")
+            if is_ref and (not np.allclose(R, np.eye(3), atol=1e-10, rtol=0)
+                           or not np.allclose(t, 0, atol=1e-10, rtol=0)):
+                raise ValueError("Reference camera must have an identity transform")
+            # Drawing needs the optical center and camera axes in world space.
+            R_inv = R.T
+            T_inv = -R_inv @ np.asarray(t).reshape(3, 1)
+        elif is_ref:
             R_inv = np.eye(3)
             T_inv = np.zeros((3, 1))
-        elif cd.get("R") is None:
+        else:
             # No extrinsics for this cam — skip
             continue
-        else:
-            R_inv = np.array(cd["R"])
-            T_inv = np.array(cd["T"]).reshape(3, 1)
 
         if not cd.get("K"):
             continue
@@ -210,6 +220,69 @@ def add_legend_dummies(traces):
         ))
 
 
+def camera_data_from_calibration(calib):
+    """Validate metadata and normalize legacy/new extrinsics to world-to-camera."""
+    camera_data = {}
+    references = set()
+    declared = calib.get("extrinsics_convention")
+    if declared not in (None, "camera_to_world", EXTRINSICS_CONVENTION):
+        raise ValueError(f"Unknown extrinsics convention: {declared!r}")
+    if calib.get("schema_version", 1) not in (1, 2):
+        raise ValueError("Unsupported calibration schema version")
+    if calib.get("schema_version") == 2 and declared != EXTRINSICS_CONVENTION:
+        raise ValueError("Schema version 2 requires world_to_camera convention metadata")
+    if calib.get("reference_camera") is not None:
+        references.add(calib["reference_camera"])
+    for cam_key, cam_meta in calib.get("cameras", {}).items():
+        if re.fullmatch(r"cam[1-9][0-9]*", cam_key) is None:
+            raise ValueError(f"Invalid camera name: {cam_key!r}")
+        ext = cam_meta.get("extrinsics")
+        if ext:
+            references.add(ext.get("reference"))
+            if ext.get("target", cam_key) != cam_key:
+                raise ValueError(f"Extrinsics target does not match {cam_key}")
+            if declared is not None and ext.get("convention", "camera_to_world") != declared:
+                raise ValueError(f"Global convention contradicts {cam_key} extrinsics")
+    if any(not isinstance(ref, str) or re.fullmatch(r"cam[1-9][0-9]*", ref) is None
+           for ref in references):
+        raise ValueError("Missing or invalid reference camera metadata")
+    if len(references) > 1:
+        raise ValueError("Camera extrinsics use inconsistent reference frames")
+    if references:
+        reference = references.pop()
+        if reference not in calib.get("cameras", {}):
+            raise ValueError(f"Reference {reference} is missing from calibration")
+        ref_cam = int(reference[3:])
+    else:
+        ref_cam = min((int(name[3:]) for name in calib.get("cameras", {})), default=1)
+        reference = f"cam{ref_cam}"
+    for cam_key, cam_meta in calib.get("cameras", {}).items():
+        cam_id = int(cam_key[3:])
+        cd = {
+            "K": cam_meta.get("K"),
+            "image_size": cam_meta.get("image_size"),
+            "intrinsic_rms": cam_meta.get("rms_error_px"),
+        }
+        ext = cam_meta.get("extrinsics")
+        if ext:
+            R, t = world_to_camera(ext, expected_reference=reference)
+            cd.update({
+                "R": R.tolist(),
+                "T": np.asarray(t).reshape(3).tolist(),
+                "reference": reference,
+                "convention": EXTRINSICS_CONVENTION,
+                "stereo_rms_px": ext.get("stereo_rms_px"),
+                "baseline_m": ext.get("baseline_m"),
+                "method": ext.get("method"),
+                "path": ext.get("path"),
+            })
+        else:
+            cd.update({"R": None, "T": None})
+        camera_data[cam_id] = cd
+
+    return camera_data, ref_cam
+
+
 def render_episode(base, episode, frustum_depth, out_path=None, verbose=True):
     """Generate camera_poses.html for one episode. Returns the output path,
     or None if the episode has no calibration_all_cameras.json."""
@@ -219,50 +292,16 @@ def render_episode(base, episode, frustum_depth, out_path=None, verbose=True):
         if verbose:
             print(f"  {episode}: no calibration_all_cameras.json (skip)")
         return None
-
     with open(calib_path) as f:
         calib = json.load(f)
-
-    camera_data = {}
-    ref_cam = None
-    for cam_key, cam_meta in calib.get("cameras", {}).items():
-        if not cam_key.startswith("cam"):
-            continue
-        try:
-            cam_id = int(cam_key[3:])
-        except ValueError:
-            continue
-        cd = {
-            "K": cam_meta.get("K"),
-            "image_size": cam_meta.get("image_size"),
-            "intrinsic_rms": cam_meta.get("rms_error_px"),
-        }
-        ext = cam_meta.get("extrinsics")
-        if ext:
-            cd.update({
-                "R": ext.get("R"),
-                "T": ext.get("T"),
-                "stereo_rms_px": ext.get("stereo_rms_px"),
-                "baseline_m": ext.get("baseline_m"),
-                "method": ext.get("method"),
-                "path": ext.get("path"),
-            })
-            if ref_cam is None and ext.get("reference"):
-                ref_cam = int(ext["reference"][3:])
-        else:
-            cd.update({"R": None, "T": None})
-        camera_data[cam_id] = cd
-
-    if ref_cam is None:
-        ref_cam = min(camera_data.keys()) if camera_data else 1
+    camera_data, ref_cam = camera_data_from_calibration(calib)
 
     traces, centers = build_traces(camera_data, ref_cam, frustum_depth)
     add_axes_at_origin(traces, length=frustum_depth * 1.5)
     add_legend_dummies(traces)
 
     n_total = len(camera_data)
-    n_with_pose = sum(1 for c in camera_data.values()
-                      if c.get("R") is not None) + (1 if ref_cam in camera_data else 0)
+    n_with_pose = len(centers)
 
     fig = go.Figure(data=traces)
     fig.update_layout(

@@ -12,6 +12,26 @@ The user has multiple GoPro Hero 10 cameras used for a 3D vision project. Two co
 
 The shooting environment is **indoors with controlled lighting**.
 
+### Current Saved-Settings Workflow
+
+The normal entry point is `pipeline.py`, using `pipeline.toml`. Install uv and FFmpeg/FFprobe on PATH, then run from the repository:
+
+```bash
+uv sync
+uv run python pipeline.py doctor
+uv run python pipeline.py
+```
+
+The current saved configuration is 10 cameras, reference cam3, a 9×12-square board with 0.03 m squares, calibration source episode 2, and output episodes `[4]`. Calibration sampling is every 90 frames with no cap. `project.data_dir` is resolved relative to the TOML file. Raw footage lives in numbered camera folders as `GX*.MP4`; complete existing `output/episode_NNNN/synced_raw/camN_synced.mp4` inputs can be reused without raw footage.
+
+Only missing required source/output episodes are synchronized in isolated staging. Incomplete existing episode directories cause an error while preserving their files. The run validates/reuses or fits the source calibration, copies it if needed, then exports full-resolution undistorted videos, the all-camera preview, and the camera-pose viewer for each target. Logs are under `output/pipeline_logs/<run-id>/run.log`; repeating the command reuses completed valid stages. Data/output are ignored by Git.
+
+`status` reports file availability only; `doctor` also checks dependencies and FFmpeg capabilities. Neither provides a new measurement of physical synchronization. `run` rejects existing metadata with failed `sync_validation` before reuse. `--dry-run` prints the plan without processing or writing files; `--episode 4 5` overrides output episodes; `--cpu` uses software video encoding/decoding; `--recalibrate` forces source fitting; `--config PATH` selects another TOML file. The command defaults to `run`. Individual stage scripts and `organize_episodes.sh` remain advanced interfaces and do not read this configuration.
+
+The saved `[frame_offsets.episode_0002]` table contains `cam4 = -1` and `cam6 = -1`, measured for the current recording only. Remove it for a new capture; do not transfer those timing corrections to other episodes when copying calibration. Source frame is logical frame plus the episode's offset. Omitted episodes/cameras explicitly mean zero in the unified runner, which passes a complete map to calibration and each export. Removing a source-offset table forces refitting if the saved calibration's offsets differ.
+
+`output/pipeline_state.json` records adopted calibration-source video sizes/modification times and the calibration SHA-256; changed source-video signatures on later runs force refitting. The first run can adopt existing validated calibration without claiming a verified historical association with those source bytes.
+
 ---
 
 ## 2. CAMERA CONFIGURATION
@@ -161,6 +181,7 @@ Play back synced videos and confirm the clap frame aligns visually across all ca
 - Audio sync at 48kHz sample rate → ~0.02ms per sample, well within one frame at 120fps (~8.3ms)
 - Cross-correlation (`scipy.signal.correlate`) is more robust than peak detection in noisy environments
 - GoPro Hero 10 has NO genlock — over long recordings (10+ min) cameras can drift by 1-2 frames. Clap at both ends to detect drift. If significant, resample/interpolate.
+- **Synchronization publication**: after chapter merging, differing logical-recording counts across cameras are an error; recordings are never silently truncated to equalize counts. Every non-reference camera needs finite audio correlation confidence >0.3. Failure writes `sync_validation` diagnostic metadata and stops before writing that episode's synchronized videos. `pipeline.py` synchronizes only missing required episodes via `--episodes` in isolated staging, checks passed sync metadata and video compatibility, then publishes those episodes while preserving existing inputs.
 - Calibration reads synchronized videos in lockstep (the same source frame number for all cameras). This preserves correspondence but does not fix residual synchronization error. Detection uses parallel `findChessboardCornersSB` on downscaled images (~960px), with `cornerSubPix` refinement at full resolution.
 - **Stored extrinsics use OpenCV world-to-camera coordinates**: `X_cam = R @ X_ref + T`, with `--ref-cam` defining the world frame. The optical center in world coordinates is `C_ref = -R.T @ T`; saved T is the world origin expressed in camera coordinates. Reference-camera extrinsics are identity/zero. Individual and nested extrinsics declare `convention: world_to_camera`; combined files declare `schema_version: 2`, `extrinsics_convention: world_to_camera`, and `reference_camera: camN`.
 - Legacy untagged extrinsics mean camera-to-world and remain readable. `migrate_calibration.py --calibration-dir DIR` validates the input, backs up the entire directory into a timestamped sibling, converts R/T once, recomputes F, and updates combined/individual JSONs. A second migration is a no-op. Intrinsic files stay byte-identical; migration does not correct distortion or regenerate old validation plots.
@@ -225,6 +246,8 @@ For sub-frame accuracy with fast motion, consider cameras with actual genlock: B
 
 ## 8. FILES DELIVERED
 
+- `pipeline.py` — Standard-library command entry point for saved settings: default `run`, read-only `doctor` and `status`, with episode/config overrides, dry-run, CPU mode, and forced recalibration. Coordinates missing-input synchronization, validation/reuse, calibration/copy, undistortion, preview, and pose visualization with a per-run log.
+- `pipeline.toml` — Editable current rig/capture settings; paths are relative to this file, and residual timing offsets are scoped to specific episodes.
 - `sync_pipeline.py` — Multi-episode audio sync pipeline (cross-correlation clap sync, stream-copy trim, chapter merging by `creation_time` + ffmpeg concat demuxer, configurable `--ref-cam`). Its `EP_preview.mp4` uses original LRV/MP4 inputs, retains lens distortion, defaults to a 30-second cap, and may fall back to the reference camera alone if the grid fails. It is an initial sync diagnostic, not a preview of the final undistorted outputs.
 - `run_calibration.py` — Intrinsic candidate fitting with global held-out frames and lens validity checks; stereo calibration with all-pairs bridging; source-validated corner cache; staged publication after validation.
 - `run_eval_epipolar.py` — Standalone epipolar validation with reference inference, lens validity checks, retained high-error measurements, and explicit failed/incomplete pair records. No high-error rejection that could hide bad calibration.

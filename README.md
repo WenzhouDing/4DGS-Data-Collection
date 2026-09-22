@@ -2,6 +2,62 @@
 
 Synchronization, validated intrinsic/extrinsic calibration, and undistorted video export for a multi-camera GoPro Hero 10 rig used in 3D vision work.
 
+## Quick Start
+
+Install [uv](https://docs.astral.sh/uv/) and FFmpeg (`ffmpeg` and `ffprobe` must be on PATH), then run these commands from the repository directory:
+
+```bash
+uv sync
+uv run python pipeline.py doctor
+uv run python pipeline.py
+```
+
+`pipeline.py` reads the saved settings in `pipeline.toml`. The checked-in settings use 10 cameras, reference cam3, a 9×12-square checkerboard with 0.03 m squares, calibration episode 2, and output episode 4. Update the file before processing another capture.
+
+The run reuses complete synchronized inputs, validates or fits the source calibration, copies it where needed, and creates undistorted videos, an all-camera preview, and a camera-pose viewer. Missing required episodes are synchronized from the numbered raw-camera folders in isolated staging. An incomplete existing episode stops the run with its files preserved. Raw recordings are needed only for episodes that must be synchronized; data and generated outputs are not included in Git.
+
+With the saved settings, results are in `output/episode_0004/`:
+
+- `synced_undistorted/` — full-resolution camera videos.
+- `calibration_undistorted/` — matching camera parameters; keep these with the videos.
+- `episode_0004_undistorted_preview.mp4` — labeled all-camera preview, with JPEG poster and JSON provenance.
+- `calibration/camera_poses.html` — camera-pose viewer.
+
+Run logs are saved to `output/pipeline_logs/<run-id>/run.log`. After resolving a reported failure, repeat the same command; completed, valid outputs are reused.
+
+## Saved Settings and Commands
+
+`project.data_dir` in `pipeline.toml` is relative to that configuration file. It contains numbered camera folders such as `1/` through `10/`, with `GX*.MP4` recordings when synchronization is needed, and the `output/` directory. Existing synchronized inputs belong at `output/episode_NNNN/synced_raw/camN_synced.mp4` for every camera.
+
+| Setting | Saved value | Meaning |
+|---------|-------------|---------|
+| `project.cameras` / `reference_camera` | `10` / `3` | Camera count and reference camera |
+| `calibration.episode` | `2` | Checkerboard episode supplying calibration |
+| `calibration.board` | `"9x12"` | Board dimensions in **squares**, not inner corners |
+| `calibration.square_size_m` | `0.03` | Measured square side in metres |
+| `calibration.sample_every` / `max_frames` | `90` / `0` | Sample every 90 frames; no sample cap |
+| `run.episodes` | `[4]` | Episodes to export; the calibration source need not be exported |
+
+The saved `[frame_offsets.episode_0002]` table sets `cam4 = -1` and `cam6 = -1` for this recording only: source frame equals logical frame plus offset. Remove that table for a new capture, and add offsets only when measured for that specific episode. In the unified runner, every omitted episode or camera explicitly means **zero offset**. It passes each episode's complete offset map to calibration/export; removing a source table triggers recalibration if the saved calibration used different offsets. Copying calibration to episode 4 does not copy episode 2's timing corrections.
+
+`output/pipeline_state.json` records the adopted calibration-source videos' sizes/modification times and the calibration SHA-256. Later changes to those source-video signatures force recalibration. An existing validated calibration can be adopted on the first run; that adoption does not verify which historical video bytes originally produced it.
+
+| Command | Purpose |
+|---------|---------|
+| `uv run python pipeline.py doctor` | Check dependencies/FFmpeg capabilities, show the plan and input availability |
+| `uv run python pipeline.py status` | Show file availability without processing or validating video/calibration contents |
+| `uv run python pipeline.py --dry-run` | Show the planned stages without writing files or running them |
+| `uv run python pipeline.py --episode 4 5` | Override output episodes for this run |
+| `uv run python pipeline.py --cpu` | Use software video encoding/decoding |
+| `uv run python pipeline.py --recalibrate` | Refit the source calibration even if an existing one passes validation |
+| `uv run python pipeline.py --config other_capture.toml` | Use another saved configuration |
+
+`doctor` and `status` report availability, not a new measurement of physical camera synchronization. During `run`, existing metadata with failed `sync_validation` is rejected before reuse.
+
+To apply changed `sample_every` or `max_frames` settings to an already validated calibration, use `--recalibrate`.
+
+`run` is the default command and can also be written explicitly. The individual scripts and grouped organizer below remain available for advanced workflows; they do not read `pipeline.toml` themselves.
+
 ## What This Does
 
 **Sync pipeline** (`sync_pipeline.py`) — Takes raw footage from N GoPro cameras that were started manually (no genlock), finds the audio clap in each recording via cross-correlation, and trims all cameras to a common timeline. Outputs frame-synced raw video (stream-copied, no re-encode), a side-by-side sync preview with audio that retains lens distortion, per-episode metadata JSON, and a sync report with sanity checks. FPS is probed from the actual video (supports 60fps, 120fps, etc.).
@@ -22,6 +78,8 @@ Both phases share the same corner detections. Source frame numbers identify corr
 
 ```
 .
+├── pipeline.py                     # Main command: run, doctor, status
+├── pipeline.toml                   # Saved rig, calibration, episode, and timing settings
 ├── sync_pipeline.py                # Multi-episode audio sync
 ├── run_calibration.py              # Intrinsic + extrinsic calibration (with bridging)
 ├── run_eval_epipolar.py            # Epipolar-geometry validation
@@ -42,7 +100,7 @@ Both phases share the same corner detections. Source frame numbers identify corr
 │   ├── GX010004.MP4
 │   ├── GL010004.LRV
 │   └── ...
-├── 2/ ... N/                       # Camera 2–N raw footage (12 cams in this project)
+├── 2/ ... N/                       # Camera 2–N raw footage (10 in the saved configuration)
 └── output/                         # All pipeline output (gitignored)
     ├── episode_0001/                # KITTI-style self-contained episode
     │   ├── synced_raw/              # Synchronized intermediate; lens distortion remains
@@ -139,14 +197,16 @@ uv run python sync_pipeline.py --base . --cams 12
 | `--search-window` | `15` | Seconds of audio to search for the clap |
 | `--preview-height` | `360` | Per-camera height in the preview grid (px) |
 | `--preview-max-sec` | `30` | Max duration of the preview clip |
+| `--episodes` | *all* | Only process the listed discovered episode indices, e.g. `--episodes 2 4` |
 
 The pipeline:
-1. Discovers GoPro MP4s in each camera folder and pairs them **by recording order** (not filename — cameras may start numbering differently and may even have different file counts; mismatched extras are dropped).
-2. Extracts audio, runs `scipy.signal.correlate()` against the reference camera (`--ref-cam`).
+
+1. Discovers GoPro MP4s, merges chapters into logical recordings, and pairs those **by recording order** rather than filename. Different logical-recording counts across cameras stop synchronization; no recordings are silently dropped.
+2. Extracts audio and runs `scipy.signal.correlate()` against the reference camera (`--ref-cam`). Every other camera must have finite correlation confidence greater than 0.3. A failure writes diagnostic metadata and stops before synchronized videos are written for that episode.
 3. Computes per-camera trim offsets and a common duration.
 4. Stream-copies (`-c copy`) each camera's video with the computed trim — no quality loss.
 5. Generates an initial N-camera sync preview from LRV proxy files (falls back to scaled MP4 if LRV missing), retaining lens distortion and using at most 30 seconds by default. Layout is biased wider-than-tall: `N≤3` → single row, otherwise `cols = ceil(N/2)`, `rows = ceil(N/cols)` (so 12 → 6×2, 5 → 3×2, 8 → 4×2). Cam 1 is top-left, filling row-major. This initial preview can fall back to the reference camera alone if the grid fails; it does not show the later undistorted export.
-6. Writes a sync report with sanity checks (confidence, offset magnitude, duration spread).
+6. Writes a sync report with sanity checks (confidence, offset magnitude, duration spread) and a `sync_validation` result in the episode metadata. `pipeline.py` checks that result before publishing newly synchronized episodes from staging.
 
 ### How Sync Works
 

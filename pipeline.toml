@@ -1,0 +1,23 @@
+# Saved settings for the current capture. Run: uv run python pipeline.py
+# For a different rig/capture, update these values before running.
+[project]
+data_dir = "."              # Relative to this file; contains 1/, 2/, ... and output/.
+cameras = 10
+reference_camera = 3
+
+[calibration]
+episode = 2                 # Checkerboard recording, shared only with an unchanged rig.
+board = "9x12"              # Number of SQUARES, not inner corners.
+square_size_m = 0.03
+sample_every = 90
+max_frames = 0              # No cap on calibration samples.
+
+[run]
+episodes = [4]              # Videos to export; the calibration episode need not be exported.
+
+# Measured corrections for this recording only. Remove for a new capture.
+# Source frame = logical frame + offset. Never copy these onto another episode.
+# Cameras/episodes omitted here use zero correction.
+[frame_offsets.episode_0002]
+cam4 = -1
+cam6 = -1

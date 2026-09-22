@@ -28,7 +28,7 @@ from datetime import datetime
 
 
 # ─── CLI ──────────────────────────────────────────────────────────
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Multi-camera GoPro audio sync pipeline")
     p.add_argument("--base", default=".", help="Base directory containing camera folders 1/ 2/ ... N/")
     p.add_argument("--cams", type=int, default=12, help="Number of cameras")
@@ -37,11 +37,14 @@ def parse_args():
     p.add_argument("--search-window", type=int, default=15, help="Seconds of audio to search for clap")
     p.add_argument("--preview-height", type=int, default=360, help="Preview per-camera height in px")
     p.add_argument("--preview-max-sec", type=int, default=30, help="Max preview duration in seconds")
-    return p.parse_args()
+    p.add_argument("--episodes", type=int, nargs="+",
+                   help="Only process these one-based discovered episode indices (default: all)")
+    return p.parse_args(argv)
 
 
 # ─── CONSTANTS ────────────────────────────────────────────────────
 SAMPLE_RATE = 48000
+SYNC_CONFIDENCE_THRESHOLD = 0.3
 
 
 def probe_creation_time(video_path):
@@ -255,8 +258,8 @@ def get_video_metadata(video_path):
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     VIDEO_BASE = os.path.abspath(args.base)
     OUTPUT_BASE = os.path.join(VIDEO_BASE, "output")
@@ -267,8 +270,16 @@ def main():
     PREVIEW_HEIGHT = args.preview_height
     PREVIEW_MAX_SEC = args.preview_max_sec
 
+    if NUM_CAMS < 2:
+        print("ERROR: --cams must be at least 2")
+        raise SystemExit(1)
     if not (1 <= REF_CAM <= NUM_CAMS):
         print(f"ERROR: --ref-cam {REF_CAM} must be in 1..{NUM_CAMS}")
+        raise SystemExit(1)
+    selected = getattr(args, "episodes", None)
+    if selected is not None and (any(index < 1 for index in selected)
+                                 or len(set(selected)) != len(selected)):
+        print("ERROR: --episodes must contain unique positive episode indices")
         raise SystemExit(1)
 
     os.makedirs(WORK_DIR, exist_ok=True)
@@ -321,17 +332,25 @@ def main():
         raise SystemExit(1)
 
     # Pair logical recordings across cameras by index (sorted earliest first).
-    # If counts differ, truncate to the minimum and warn.
+    # A missing recording can shift every later pairing, so truncation is unsafe.
     counts = {cam: len(r) for cam, r in cam_recordings.items()}
     if len(set(counts.values())) > 1:
-        print(f"\n  WARNING: cameras have different recording counts {counts}. "
-              f"Truncating to the minimum.")
+        print(f"\nERROR: cameras have different recording counts {counts}. "
+              "Resolve missing recordings before synchronization.")
+        raise SystemExit(1)
     num_episodes = min(counts.values())
     print(f"\n  -> {num_episodes} complete episode(s) (all {NUM_CAMS} cameras present)")
+    episode_indices = list(range(1, num_episodes + 1)) if selected is None else selected
+    missing = [index for index in episode_indices if index > num_episodes]
+    if missing:
+        print(f"ERROR: requested episode indices {missing} do not exist; "
+              f"discovered episodes are 1..{num_episodes}")
+        raise SystemExit(1)
 
     episodes = {}
-    for s in range(num_episodes):
-        episode_name = f"episode_{s + 1:04d}"
+    for index in episode_indices:
+        s = index - 1
+        episode_name = f"episode_{index:04d}"
         episode_files = {}
         for cam in range(1, NUM_CAMS + 1):
             rec = cam_recordings[cam][s]
@@ -375,7 +394,6 @@ def main():
         episode_out = os.path.join(OUTPUT_BASE, episode_name)
         synced_dir = os.path.join(episode_out, "synced_raw")
         meta_dir = os.path.join(episode_out, "metadata")
-        os.makedirs(synced_dir, exist_ok=True)
         os.makedirs(meta_dir, exist_ok=True)
 
         # Probe FPS from first camera's first chapter (all cams share settings)
@@ -415,6 +433,29 @@ def main():
             print(f"    Cam {ref_cam} -> Cam {cam}: {lag:+d} samples "
                   f"({lag_ms:+.2f}ms, {lag_frames:+.2f} frames) conf={conf:.4f}")
 
+        confidences = {
+            f"cam{cam}": float(conf) if np.isfinite(conf) else None
+            for cam, (_, conf) in offsets.items()
+        }
+        failed_cameras = [f"cam{cam}" for cam in range(1, NUM_CAMS + 1)
+                          if cam != REF_CAM and (confidences[f"cam{cam}"] is None
+                          or confidences[f"cam{cam}"] <= SYNC_CONFIDENCE_THRESHOLD)]
+        sync_validation = {"passed": not failed_cameras,
+                           "confidence_threshold": SYNC_CONFIDENCE_THRESHOLD,
+                           "camera_confidences": confidences,
+                           "failed_cameras": failed_cameras}
+        if failed_cameras:
+            diagnostic = {"episode_name": episode_name, "reference_camera": REF_CAM,
+                          "fps": FPS, "sample_rate": SAMPLE_RATE,
+                          "sync_validation": sync_validation}
+            metadata_path = os.path.join(meta_dir, f"{episode_name}_metadata.json")
+            with open(metadata_path, "w") as stream:
+                json.dump(diagnostic, stream, indent=2, allow_nan=False)
+            print(f"ERROR: synchronization confidence must exceed {SYNC_CONFIDENCE_THRESHOLD}; "
+                  f"failed cameras: {', '.join(failed_cameras)}. "
+                  f"No synchronized videos written for {episode_name}.")
+            raise SystemExit(1)
+
         # Clap/peak detection
         print("\n  Detecting transient peaks...")
         peaks_info = {}
@@ -450,6 +491,7 @@ def main():
         # Trim raw video (stream copy — no re-encode). Multi-chapter recordings
         # go through the concat demuxer; -ss is applied as input-side seek.
         print("\n  Trimming synced raw video...")
+        os.makedirs(synced_dir, exist_ok=True)
         for cam in range(1, NUM_CAMS + 1):
             inp_args = ffmpeg_input_args(
                 episode_files[cam]["paths"], WORK_DIR,
@@ -573,6 +615,7 @@ def main():
             "reference_camera": ref_cam,
             "common_duration_sec": common_dur,
             "common_duration_frames": int(common_dur * FPS),
+            "sync_validation": sync_validation,
             "cameras": {},
         }
         for cam in range(1, NUM_CAMS + 1):
@@ -653,8 +696,8 @@ def main():
         dur_spread = max(episode_files[c]["duration"] for c in range(1, NUM_CAMS + 1)) - \
                      min(episode_files[c]["duration"] for c in range(1, NUM_CAMS + 1))
         checks = [
-            ("Cross-correlation confidence > 0.3",
-             "PASS" if min_conf > 0.3 else "FAIL", f"min={min_conf:.4f}"),
+            (f"Cross-correlation confidence > {SYNC_CONFIDENCE_THRESHOLD}",
+             "PASS" if min_conf > SYNC_CONFIDENCE_THRESHOLD else "FAIL", f"min={min_conf:.4f}"),
             ("Max offset < 5000ms",
              "PASS" if max_offset_ms < 5000 else "WARN", f"{max_offset_ms:.1f}ms"),
             ("Raw duration spread < 10s",
@@ -695,7 +738,8 @@ def main():
     for sn in episodes:
         print(f"  {sn}/")
     print("\nDone!")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
